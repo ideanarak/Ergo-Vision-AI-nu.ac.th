@@ -7,9 +7,15 @@ import pandas as pd
 from datetime import datetime
 from ultralytics import YOLO
 import time
-import winsound  
-from plyer import notification
 import hashlib
+import platform
+
+# ตรวจสอบระบบปฏิบัติการ (Windows หรือ Linux บน Cloud)
+is_windows = platform.system() == 'Windows'
+
+if is_windows:
+    import winsound
+    from plyer import notification
 
 # ==========================================
 # ฟังก์ชันเข้ารหัสและตรวจสอบรหัสผ่าน
@@ -98,16 +104,12 @@ def save_to_db(conn, username, shoulder_tilt, torso_tilt, status):
 st.set_page_config(page_title="Ergo-Vision AI", layout="wide")
 conn = init_db()
 
-# กำหนด Session State สำหรับจำการ Login
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.username = ""
 if 'bad_posture_start_time' not in st.session_state:
     st.session_state.bad_posture_start_time = None
 
-# ==========================================
-# ส่วนที่ 1: ระบบ Login / Register (แสดงเฉพาะตอนยังไม่ล็อกอิน)
-# ==========================================
 if not st.session_state.logged_in:
     st.title("🔐 เข้าสู่ระบบ Ergo-Vision AI")
     menu = ["เข้าสู่ระบบ (Login)", "สมัครสมาชิก (Register)"]
@@ -143,9 +145,6 @@ if not st.session_state.logged_in:
                 except sqlite3.IntegrityError:
                     st.error("ชื่อผู้ใช้นี้มีคนใช้แล้ว กรุณาใช้ชื่ออื่น")
 
-# ==========================================
-# ส่วนที่ 2: ระบบกล้องหลัก (แสดงเฉพาะตอนล็อกอินผ่านแล้ว)
-# ==========================================
 else:
     st.title(f"🪑 Ergo-Vision AI (ผู้ใช้งาน: {st.session_state.username})")
     
@@ -178,7 +177,12 @@ else:
             metric_box2 = st.empty()
 
         if run:
-            cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
+            # เปิดกล้องโดยรองรับทั้ง Windows และ Linux
+            if is_windows:
+                cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
+            else:
+                cap = cv2.VideoCapture(camera_id)
+                
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
@@ -199,7 +203,6 @@ else:
 
                     keypoints = results[0].keypoints
                     if keypoints is not None and len(keypoints.xy) > 0:
-                        # เลือกเป้าหมายที่โมเดลมั้นใจที่สุด (ป้องกันไปจับคนข้างหลัง)
                         xy = keypoints.xy[0].cpu().numpy()
                         conf = keypoints.conf[0].cpu().numpy()
 
@@ -223,17 +226,19 @@ else:
                                 if elapsed_time >= 10:
                                     status_box.error(f"🚨 ระวัง! นั่งผิดท่ามา {int(elapsed_time)} วินาทีแล้ว 🔊")
                                     st.toast('🚨 นั่งผิดท่าเกิน 10 วินาทีแล้ว! กรุณายืดตัวตรง', icon='⚠️')
-                                    winsound.PlaySound("SystemHand", winsound.SND_ALIAS | winsound.SND_ASYNC)
-
-                                    try:
-                                        notification.notify(
-                                            title="⚠️ แจ้งเตือนจาก Ergo-Vision AI",
-                                            message="คุณนั่งผิดท่าเกิน 10 วินาทีแล้ว กรุณาปรับท่านั่งครับ!",
-                                            app_name="Ergo-Vision",
-                                            timeout=2
-                                        )
-                                    except Exception:
-                                        pass
+                                    
+                                    # แจ้งเตือนเฉพาะบน Windows
+                                    if is_windows:
+                                        winsound.PlaySound("SystemHand", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                                        try:
+                                            notification.notify(
+                                                title="⚠️ แจ้งเตือนจาก Ergo-Vision AI",
+                                                message="คุณนั่งผิดท่าเกิน 10 วินาทีแล้ว กรุณาปรับท่านั่งครับ!",
+                                                app_name="Ergo-Vision",
+                                                timeout=2
+                                            )
+                                        except Exception:
+                                            pass
 
                                     st.session_state.bad_posture_start_time = time.time() - 7
                                 else:
