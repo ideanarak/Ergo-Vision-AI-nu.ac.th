@@ -7,8 +7,8 @@ import pandas as pd
 from datetime import datetime
 from ultralytics import YOLO
 import time
+import threading
 from twilio.rest import Client
-# แก้ไขบรรทัดนี้
 from streamlit_webrtc import webrtc_streamer, RTCConfiguration, VideoTransformerBase, WebRtcMode
 import av
 
@@ -17,26 +17,32 @@ import av
 # ==========================================
 @st.cache_resource
 def load_yolo_model():
-    return YOLO('yolov8n-pose.pt')
+    # ใช้โมเดล nano (เล็กสุด) และ warm-up ครั้งแรกด้วยภาพเปล่า เพื่อลด latency ของเฟรมแรกจริง
+    m = YOLO('yolov8n-pose.pt')
+    m(np.zeros((320, 320, 3), dtype=np.uint8), verbose=False)
+    return m
 
 model = load_yolo_model()
 
 # ==========================================
 # 2. ดึงค่า TURN Server จาก Twilio
 # ==========================================
-@st.cache_data
+# สำคัญ: ต้องใส่ ttl ให้ cache หมดอายุก่อน token ของ Twilio (ปกติ token อยู่ได้ไม่กี่ชม.)
+# ถ้าไม่ตั้ง ttl แอปจะยังใช้ token เก่าที่หมดอายุไปเรื่อยๆ ทำให้ต่อกล้องไม่ติดแบบเงียบๆ
+@st.cache_data(ttl=3000)  # รีเฟรชทุก 50 นาที
 def get_ice_servers():
     try:
-        # ดึงค่าจาก Streamlit Secrets
         account_sid = st.secrets["TWILIO_ACCOUNT_SID"]
         auth_token = st.secrets["TWILIO_AUTH_TOKEN"]
-        
-        # สร้าง Token เพื่อเข้าถึง TURN Server
+
         client = Client(account_sid, auth_token)
         token = client.tokens.create()
         return token.ice_servers
     except Exception as e:
-        st.warning("ระบบยังไม่ได้ตั้งค่า Twilio หรือรหัสผิด จะใช้ STUN ของ Google แทน ซึ่งอาจทำให้กล้องไม่ติดในบางเครือข่าย")
+        st.warning(
+            "ระบบยังไม่ได้ตั้งค่า Twilio หรือรหัสผิด จะใช้ STUN ของ Google แทน "
+            "ซึ่งอาจทำให้กล้องไม่ติดในบางเครือข่าย (โดยเฉพาะ WiFi องค์กร/มือถือที่มี NAT เข้ม)"
+        )
         return [{"urls": ["stun:stun.l.google.com:19302"]}]
 
 # ==========================================
@@ -44,12 +50,14 @@ def get_ice_servers():
 # ==========================================
 def get_shoulder_tilt_theta(lx, ly, rx, ry):
     adjacent = abs(lx - rx)
-    if adjacent == 0: return 90.0
+    if adjacent == 0:
+        return 90.0
     return math.degrees(math.atan(abs(ly - ry) / adjacent))
 
 def get_torso_tilt_phi(lx, ly, rx, ry, l_hip_x, l_hip_y, r_hip_x, r_hip_y):
     adjacent = abs(((ly + ry) / 2) - ((l_hip_y + r_hip_y) / 2))
-    if adjacent == 0: return 90.0
+    if adjacent == 0:
+        return 90.0
     return math.degrees(math.atan(abs(((lx + rx) / 2) - ((l_hip_x + r_hip_x) / 2)) / adjacent))
 
 # ==========================================
@@ -61,12 +69,22 @@ class PostureTransformer(VideoTransformerBase):
         self.phi_threshold = 10
         self.bad_posture_start = None
 
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1) # กลับซ้ายขวาให้เหมือนกระจก
-        
-        results = model(img, verbose=False)
-        annotated_frame = results[0].plot()
+        # --- ตัวแปรสำหรับลดภาระ CPU ---
+        self.frame_count = 0
+        self.process_every_n_frames = 3   # รัน YOLO ทุกๆ 3 เฟรม เฟรมที่เหลือใช้ผลล่าสุดซ้ำ
+        self.infer_width = 320            # ย่อภาพก่อนเข้าโมเดลเพื่อความเร็ว
+        self.lock = threading.Lock()
+        self.last_annotated = None        # เก็บผลล่าสุดไว้วาดซ้ำในเฟรมที่ข้าม
+
+    def _process(self, img):
+        h, w = img.shape[:2]
+        scale = self.infer_width / w
+        small = cv2.resize(img, (self.infer_width, int(h * scale)))
+
+        results = model(small, verbose=False, imgsz=self.infer_width)
+        annotated_small = results[0].plot()
+        # ขยายภาพที่ annotate แล้วกลับเป็นขนาดเดิมเพื่อแสดงผล
+        annotated_frame = cv2.resize(annotated_small, (w, h))
 
         keypoints = results[0].keypoints
         if keypoints is not None and len(keypoints.xy) > 0:
@@ -84,9 +102,10 @@ class PostureTransformer(VideoTransformerBase):
 
                 is_bad_posture = (theta > self.theta_threshold) or (phi > self.phi_threshold)
 
-                # แสดงองศาบนจอ
-                cv2.putText(annotated_frame, f"Shoulder Tilt: {theta:.1f} deg", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                cv2.putText(annotated_frame, f"Torso Tilt: {phi:.1f} deg", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                cv2.putText(annotated_frame, f"Shoulder Tilt: {theta:.1f} deg", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                cv2.putText(annotated_frame, f"Torso Tilt: {phi:.1f} deg", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
                 if is_bad_posture:
                     if self.bad_posture_start is None:
@@ -94,14 +113,40 @@ class PostureTransformer(VideoTransformerBase):
                     elapsed = time.time() - self.bad_posture_start
 
                     if elapsed >= 5:
-                        cv2.putText(annotated_frame, f"🚨 WARNING: BAD POSTURE > {int(elapsed)}s!", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
+                        cv2.putText(annotated_frame, f"WARNING: BAD POSTURE > {int(elapsed)}s!", (10, 120),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
                     else:
-                        cv2.putText(annotated_frame, f"⚠️ Warning ({int(elapsed)}/5s)", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 165, 255), 2)
+                        cv2.putText(annotated_frame, f"Warning ({int(elapsed)}/5s)", (10, 120),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 165, 255), 2)
                 else:
                     self.bad_posture_start = None
-                    cv2.putText(annotated_frame, "✅ Good Posture", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                    cv2.putText(annotated_frame, "Good Posture", (10, 120),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
-        return av.VideoFrame.from_ndarray(annotated_frame, format="bgr24")
+        return annotated_frame
+
+    def recv(self, frame):
+        try:
+            img = frame.to_ndarray(format="bgr24")
+            img = cv2.flip(img, 1)  # กลับซ้ายขวาให้เหมือนกระจก
+
+            self.frame_count += 1
+
+            # รัน YOLO เฉพาะทุกๆ N เฟรม เพื่อไม่ให้ frame queue ล้นจน WebRTC หน่วง/ค้าง
+            if self.frame_count % self.process_every_n_frames == 0:
+                annotated_frame = self._process(img)
+                with self.lock:
+                    self.last_annotated = annotated_frame
+            else:
+                with self.lock:
+                    annotated_frame = self.last_annotated if self.last_annotated is not None else img
+
+            return av.VideoFrame.from_ndarray(annotated_frame, format="bgr24")
+
+        except Exception as e:
+            # กัน exception ทำให้ thread ประมวลผลตายเงียบๆ (อาการทั่วไปคือวิดีโอค้างสนิท)
+            print(f"[PostureTransformer.recv] error: {e}")
+            return frame
 
 # ==========================================
 # 5. หน้าตา UI ของ Streamlit
@@ -116,16 +161,22 @@ theta_slider = st.sidebar.slider('ไหล่เอียงสูงสุด 
 phi_slider = st.sidebar.slider('ตัวเอนสูงสุด (φ)', 1, 20, 10)
 
 # ตั้งค่าเซิร์ฟเวอร์ด้วย Twilio
-rtc_config = RTCConfiguration({"iceServers": get_ice_servers()})
+rtc_config = RTCConfiguration({"iceServers": get_ice_servers(), "iceCandidatePoolSize": 10})
 
-# เปิดใช้งาน WebRTC
-# เปลี่ยนจาก mode=1 เป็นแบบนี้ครับ
+# เปิดใช้งาน WebRTC — ขอความละเอียด/เฟรมเรตต่ำลงจากกล้องผู้ใช้ เพื่อลดภาระ encode/decode/inference
 webrtc_ctx = webrtc_streamer(
     key="ergo-posture-webrtc",
-    mode=WebRtcMode.SENDRECV,  # <--- แก้ไขตรงนี้ครับ
+    mode=WebRtcMode.SENDRECV,
     rtc_configuration=rtc_config,
     video_processor_factory=PostureTransformer,
-    media_stream_constraints={"video": True, "audio": False},
+    media_stream_constraints={
+        "video": {
+            "width": {"ideal": 640},
+            "height": {"ideal": 480},
+            "frameRate": {"ideal": 15, "max": 15},
+        },
+        "audio": False,
+    },
     async_processing=True,
 )
 
@@ -135,3 +186,10 @@ if webrtc_ctx.video_processor:
     webrtc_ctx.video_processor.phi_threshold = phi_slider
 
 st.info("💡 หมายเหตุ: หากใช้งานบนมือถือ ให้ตรวจสอบว่าอนุญาตสิทธิ์ใช้งานกล้องผ่านเบราว์เซอร์แล้ว")
+
+if webrtc_ctx.state.playing is False and webrtc_ctx.state.signalling is False:
+    st.warning(
+        "หากกดเริ่มแล้วภาพไม่ขึ้นภายใน ~10 วินาที มักเกิดจากเครือข่ายของคุณบล็อกการเชื่อมต่อ WebRTC "
+        "และไม่มี TURN server ใช้งานได้ (ตรวจสอบว่าตั้งค่า TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN "
+        "ใน Streamlit Cloud > Settings > Secrets ถูกต้องแล้ว)"
+    )
