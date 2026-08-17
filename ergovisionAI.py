@@ -6,18 +6,14 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 from ultralytics import YOLO
+import time
 import hashlib
+import platform
 
-# ==========================================
-# ฟังก์ชันเข้ารหัสและตรวจสอบรหัสผ่าน
-# ==========================================
-def make_hashes(password):
-    return hashlib.sha256(str.encode(password)).hexdigest()
-
-def check_hashes(password, hashed_text):
-    if make_hashes(password) == hashed_text:
-        return hashed_text
-    return False
+# ระบบเสียงแจ้งเตือน (ทำงานเมื่อรันบนคอมพิวเตอร์ตัวเองเท่านั้น)
+is_windows = platform.system() == 'Windows'
+if is_windows:
+    import winsound
 
 # ==========================================
 # 1. โหลดโมเดล YOLOv8 Pose
@@ -32,198 +28,126 @@ model = load_yolo_model()
 # 2. ฟังก์ชันคำนวณทางคณิตศาสตร์
 # ==========================================
 def get_shoulder_tilt_theta(lx, ly, rx, ry):
-    opposite = abs(ly - ry)
     adjacent = abs(lx - rx)
     if adjacent == 0: return 90.0
-    return math.degrees(math.atan(opposite / adjacent))
+    return math.degrees(math.atan(abs(ly - ry) / adjacent))
 
 def get_torso_tilt_phi(lx, ly, rx, ry, l_hip_x, l_hip_y, r_hip_x, r_hip_y):
-    mid_shoulder_x = (lx + rx) / 2
-    mid_shoulder_y = (ly + ry) / 2
-    mid_hip_x = (l_hip_x + r_hip_x) / 2
-    mid_hip_y = (l_hip_y + r_hip_y) / 2
-    
-    opposite = abs(mid_shoulder_x - mid_hip_x)
-    adjacent = abs(mid_shoulder_y - mid_hip_y)
+    adjacent = abs(((ly + ry) / 2) - ((l_hip_y + r_hip_y) / 2))
     if adjacent == 0: return 90.0
-    return math.degrees(math.atan(opposite / adjacent))
+    return math.degrees(math.atan(abs(((lx + rx) / 2) - ((l_hip_x + r_hip_x) / 2)) / adjacent))
 
 # ==========================================
-# 3. ฟังก์ชันจัดการฐานข้อมูล SQLite
+# 3. ฐานข้อมูล (SQLite)
 # ==========================================
 def init_db():
     conn = sqlite3.connect('ergonomic_posture.db', check_same_thread=False)
     c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            password TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS posture_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            timestamp DATETIME,
-            shoulder_tilt REAL,
-            torso_tilt REAL,
-            status TEXT
-        )
-    ''')
+    c.execute('CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS posture_log (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, timestamp DATETIME, shoulder_tilt REAL, torso_tilt REAL, status TEXT)')
     conn.commit()
     return conn
 
-def add_user(conn, username, password):
-    c = conn.cursor()
-    c.execute('INSERT INTO users (username, password) VALUES (?, ?)', (username, password))
-    conn.commit()
-
-def login_user(conn, username, password):
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE username = ? AND password = ?', (username, password))
-    return c.fetchall()
-
-def save_to_db(conn, username, shoulder_tilt, torso_tilt, status):
-    c = conn.cursor()
-    c.execute('INSERT INTO posture_log (username, timestamp, shoulder_tilt, torso_tilt, status) VALUES (?, ?, ?, ?, ?)',
-              (username, datetime.now(), shoulder_tilt, torso_tilt, status))
-    conn.commit()
-
-# ==========================================
-# 4. หน้าตาแอปพลิเคชัน (Streamlit UI)
-# ==========================================
-st.set_page_config(page_title="Ergo-Vision AI", layout="wide")
 conn = init_db()
 
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.username = ""
+# ==========================================
+# 4. Streamlit UI
+# ==========================================
+st.set_page_config(page_title="Ergo-Vision AI (Local)", layout="wide")
 
-if not st.session_state.logged_in:
-    st.title("🔐 เข้าสู่ระบบ Ergo-Vision AI")
-    menu = ["เข้าสู่ระบบ (Login)", "สมัครสมาชิก (Register)"]
-    choice = st.selectbox("เมนู", menu)
+if 'username' not in st.session_state:
+    st.session_state.username = "User"
+if 'bad_posture_start' not in st.session_state:
+    st.session_state.bad_posture_start = None
 
-    if choice == "เข้าสู่ระบบ (Login)":
-        st.subheader("Login")
-        username = st.text_input("ชื่อผู้ใช้ (Username)")
-        password = st.text_input("รหัสผ่าน (Password)", type='password')
-        if st.button("เข้าสู่ระบบ"):
-            hashed_pswd = make_hashes(password)
-            result = login_user(conn, username, hashed_pswd)
-            if result:
-                st.session_state.logged_in = True
-                st.session_state.username = username
-                st.success(f"ยินดีต้อนรับคุณ {username}")
-                st.rerun() 
-            else:
-                st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
+st.title("🪑 Ergo-Vision AI: Real-time Posture Monitor")
+tab1, tab2 = st.tabs(["📷 ตรวจจับแบบ Real-time", "📊 ประวัติย้อนหลัง"])
 
-    elif choice == "สมัครสมาชิก (Register)":
-        st.subheader("สร้างบัญชีใหม่")
-        new_user = st.text_input("ตั้งชื่อผู้ใช้ (Username)")
-        new_password = st.text_input("ตั้งรหัสผ่าน (Password)", type='password')
-        if st.button("สมัครสมาชิก"):
-            if new_user == "" or new_password == "":
-                st.warning("กรุณากรอกข้อมูลให้ครบถ้วน")
-            else:
-                try:
-                    add_user(conn, new_user, make_hashes(new_password))
-                    st.success("สมัครสมาชิกสำเร็จ! คุณสามารถเข้าสู่ระบบได้เลย")
-                except sqlite3.IntegrityError:
-                    st.error("ชื่อผู้ใช้นี้มีคนใช้แล้ว กรุณาใช้ชื่ออื่น")
+with tab1:
+    st.sidebar.header("⚙️ ตั้งค่าระบบ")
+    run = st.sidebar.checkbox('🟢 เปิดกล้องเริ่มตรวจจับ', value=False)
+    theta_threshold = st.sidebar.slider('ไหล่เอียงสูงสุด (θ)', 1, 15, 5)
+    phi_threshold = st.sidebar.slider('ตัวเอนสูงสุด (φ)', 1, 20, 10)
 
-else:
-    st.title(f"🪑 Ergo-Vision AI (ผู้ใช้งาน: {st.session_state.username})")
-    
-    if st.sidebar.button("🚪 ออกจากระบบ (Logout)"):
-        st.session_state.logged_in = False
-        st.session_state.username = ""
-        st.rerun()
-    
-    st.sidebar.markdown("---")
-    
-    tab1, tab2 = st.tabs(["📷 ตรวจสอบท่านั่ง", "📊 ฐานข้อมูล & ประวัติ"])
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        FRAME_WINDOW = st.image([])
+    with col2:
+        status_box = st.empty()
+        metric1 = st.empty()
+        metric2 = st.empty()
 
-    with tab1:
-        st.sidebar.header("⚙️ ตั้งค่าเกณฑ์ความผิดปกติ")
-        theta_threshold = st.sidebar.slider('ไหล่เอียงสูงสุด (θ)', 1, 15, 5)
-        phi_threshold = st.sidebar.slider('ตัวเอนสูงสุด (φ)', 1, 20, 10)
-
-        st.subheader("📸 ถ่ายภาพเพื่อประเมินท่านั่ง")
-        st.info("💡 ระบบจะทำการวิเคราะห์ท่านั่งของคุณจากภาพถ่าย และบันทึกข้อมูลลงในระบบ")
+    if run:
+        cap = cv2.VideoCapture(0) # เปิดกล้อง
         
-        # ใช้วิธีดึงกล้องแบบ Native ของ Streamlit
-        camera_image = st.camera_input("กดถ่ายภาพ")
+        if not cap.isOpened():
+            st.error("⚠️ ไม่สามารถเปิดกล้องได้ โปรดตรวจสอบการเชื่อมต่อ")
+        else:
+            try:
+                save_counter = 0
+                while run:
+                    ret, frame = cap.read()
+                    if not ret:
+                        time.sleep(0.1)
+                        continue
 
-        if camera_image is not None:
-            # แปลงภาพจาก Streamlit เป็นรูปแบบที่ OpenCV / YOLO อ่านได้
-            bytes_data = camera_image.getvalue()
-            cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
-            
-            # ประมวลผลด้วย YOLO
-            results = model(cv2_img, verbose=False)
-            annotated_frame = results[0].plot()
-            image_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                    frame = cv2.flip(frame, 1)
+                    results = model(frame, verbose=False)
+                    annotated_frame = results[0].plot()
+                    image_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
 
-            keypoints = results[0].keypoints
-            
-            if keypoints is not None and len(keypoints.xy) > 0:
-                xy = keypoints.xy[0].cpu().numpy()
-                conf = keypoints.conf[0].cpu().numpy()
+                    keypoints = results[0].keypoints
+                    if keypoints is not None and len(keypoints.xy) > 0:
+                        xy = keypoints.xy[0].cpu().numpy()
+                        conf = keypoints.conf[0].cpu().numpy()
 
-                # ตรวจสอบว่าโมเดลจับจุดไหล่และสะโพกได้ครบถ้วนหรือไม่
-                if len(xy) >= 13 and conf[5] > 0.3 and conf[6] > 0.3 and conf[11] > 0.3 and conf[12] > 0.3:
-                    lx, ly = xy[5]
-                    rx, ry = xy[6]
-                    l_hip_x, l_hip_y = xy[11]
-                    r_hip_x, r_hip_y = xy[12]
+                        if len(xy) >= 13 and all(c > 0.3 for c in conf[[5, 6, 11, 12]]):
+                            lx, ly = xy[5]
+                            rx, ry = xy[6]
+                            l_hip_x, l_hip_y = xy[11]
+                            r_hip_x, r_hip_y = xy[12]
 
-                    # คำนวณองศา
-                    theta = get_shoulder_tilt_theta(lx, ly, rx, ry)
-                    phi = get_torso_tilt_phi(lx, ly, rx, ry, l_hip_x, l_hip_y, r_hip_x, r_hip_y)
+                            theta = get_shoulder_tilt_theta(lx, ly, rx, ry)
+                            phi = get_torso_tilt_phi(lx, ly, rx, ry, l_hip_x, l_hip_y, r_hip_x, r_hip_y)
 
-                    is_bad_posture = (theta > theta_threshold) or (phi > phi_threshold)
-                    status_text = "ผิดปกติ" if is_bad_posture else "ปกติ"
+                            is_bad_posture = (theta > theta_threshold) or (phi > phi_threshold)
 
-                    # แสดงผล
-                    col_img, col_res = st.columns([2, 1])
+                            if is_bad_posture:
+                                if st.session_state.bad_posture_start is None:
+                                    st.session_state.bad_posture_start = time.time()
+                                elapsed = time.time() - st.session_state.bad_posture_start
+
+                                if elapsed >= 5: # เตือนถ้านั่งผิดท่าเกิน 5 วินาที
+                                    status_box.error(f"🚨 นั่งผิดท่ามา {int(elapsed)} วินาทีแล้ว!")
+                                    if is_windows:
+                                        winsound.Beep(1000, 500) # ส่งเสียง Beep แจ้งเตือน
+                                else:
+                                    status_box.warning(f"⚠️ ระวัง! เริ่มนั่งผิดท่า ({int(elapsed)}/5 วิ)")
+                            else:
+                                st.session_state.bad_posture_start = None
+                                status_box.success("✅ ท่านั่งสมดุลดีเยี่ยม")
+
+                            metric1.metric("มุมไหล่เอียง", f"{theta:.1f}°")
+                            metric2.metric("มุมตัวเอน", f"{phi:.1f}°")
+
+                            save_counter += 1
+                            if save_counter >= 30: # บันทึกลงฐานข้อมูลเป็นระยะ
+                                c = conn.cursor()
+                                c.execute('INSERT INTO posture_log (username, timestamp, shoulder_tilt, torso_tilt, status) VALUES (?, ?, ?, ?, ?)',
+                                          (st.session_state.username, datetime.now(), theta, phi, "ผิดปกติ" if is_bad_posture else "ปกติ"))
+                                conn.commit()
+                                save_counter = 0
+
+                    FRAME_WINDOW.image(image_rgb)
                     
-                    with col_img:
-                        st.image(image_rgb, caption="ภาพที่วิเคราะห์แล้ว", use_container_width=True)
-                        
-                    with col_res:
-                        st.markdown("### ผลการประเมิน")
-                        if is_bad_posture:
-                            st.error(f"🚨 **{status_text}**")
-                            st.write("ตรวจพบความเอียงเกินเกณฑ์ที่กำหนด กรุณาปรับท่านั่งให้ตรงขึ้น")
-                        else:
-                            st.success(f"✅ **{status_text}**")
-                            st.write("ท่านั่งของคุณอยู่ในเกณฑ์ดีเยี่ยม!")
-                            
-                        st.metric("มุมไหล่เอียง (θ)", f"{theta:.1f}°", f"เกณฑ์: {theta_threshold}°", delta_color="off")
-                        st.metric("มุมตัวเอน (φ)", f"{phi:.1f}°", f"เกณฑ์: {phi_threshold}°", delta_color="off")
+            finally:
+                cap.release()
 
-                    # บันทึกข้อมูลลงฐานข้อมูล
-                    save_to_db(conn, st.session_state.username, theta, phi, status_text)
-                    st.toast('บันทึกข้อมูลลงฐานข้อมูลเรียบร้อยแล้ว!', icon='💾')
-                else:
-                    st.image(image_rgb, use_container_width=True)
-                    st.warning("⚠️ มองไม่เห็นจุดสำคัญในภาพ (ไหล่ หรือ สะโพก) กรุณาถ่ายใหม่ให้เห็นครึ่งตัวชัดเจน")
-            else:
-                st.warning("⚠️ ไม่พบคนในภาพ กรุณาถ่ายใหม่")
-
-    with tab2:
-        st.header(f"📂 ประวัติและแนวโน้มการนั่งของคุณ {st.session_state.username}")
-        if st.button("🔄 ดึงข้อมูลล่าสุด"):
-            query = f"SELECT timestamp, shoulder_tilt, torso_tilt, status FROM posture_log WHERE username='{st.session_state.username}' ORDER BY id DESC LIMIT 100"
-            df = pd.read_sql_query(query, conn)
-            if not df.empty:
-                st.dataframe(df, use_container_width=True)
-                st.markdown("---")
-                st.subheader("📈 กราฟวิเคราะห์องศาการนั่ง")
-                st.line_chart(df[['shoulder_tilt', 'torso_tilt']])
-            else:
-                st.write("ยังไม่มีข้อมูลบันทึกในระบบครับ ลองใช้งานระบบตรวจจับสักครู่ก่อนนะครับ")
+with tab2:
+    if st.button("🔄 ดึงข้อมูลล่าสุด"):
+        df = pd.read_sql_query("SELECT timestamp, shoulder_tilt, torso_tilt, status FROM posture_log ORDER BY id DESC LIMIT 50", conn)
+        if not df.empty:
+            st.dataframe(df, use_container_width=True)
+            st.line_chart(df[['shoulder_tilt', 'torso_tilt']])
 
 conn.close()
