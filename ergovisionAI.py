@@ -160,8 +160,43 @@ st.sidebar.header("⚙️ ตั้งค่าความไวการแจ
 theta_slider = st.sidebar.slider('ไหล่เอียงสูงสุด (θ)', 1, 15, 5)
 phi_slider = st.sidebar.slider('ตัวเอนสูงสุด (φ)', 1, 20, 10)
 
+st.sidebar.header("🌐 ตั้งค่าการเชื่อมต่อ (แก้ปัญหาเน็ตองค์กร/มหาวิทยาลัย)")
+force_turn_relay = st.sidebar.checkbox(
+    "บังคับใช้ TURN relay อย่างเดียว (แนะนำสำหรับเน็ตที่บล็อก UDP)",
+    value=True,
+    help="เน็ตมหาวิทยาลัย/องค์กรส่วนใหญ่บล็อก UDP ทิ้ง เหลือให้ผ่านได้แค่ TCP/443 "
+         "การบังคับใช้ TURN relay จะทำให้ทราฟฟิกวิ่งผ่าน TLS พอร์ต 443 เหมือน HTTPS ปกติ "
+         "ทำให้ไฟร์วอลล์ไม่บล็อก และยังเชื่อมต่อได้เร็วกว่าด้วย เพราะข้ามขั้นตอนลองต่อ P2P ที่มักจะ timeout ก่อนบนเน็ตแบบนี้"
+)
+
 # ตั้งค่าเซิร์ฟเวอร์ด้วย Twilio
-rtc_config = RTCConfiguration({"iceServers": get_ice_servers(), "iceCandidatePoolSize": 10})
+ice_servers = get_ice_servers()
+
+rtc_config_dict = {"iceServers": ice_servers, "iceCandidatePoolSize": 10}
+if force_turn_relay:
+    rtc_config_dict["iceTransportPolicy"] = "relay"
+rtc_config = RTCConfiguration(rtc_config_dict)
+
+# --- Debug panel: เช็คว่ากำลังใช้ Twilio TURN จริง หรือ fallback เป็น Google STUN ---
+with st.sidebar.expander("🔍 ตรวจสอบสถานะ ICE Server"):
+    urls_found = []
+    for s in ice_servers:
+        u = s.get("urls") if isinstance(s, dict) else getattr(s, "urls", None)
+        if isinstance(u, list):
+            urls_found.extend(u)
+        elif u:
+            urls_found.append(u)
+
+    is_turn_active = any("turn" in u for u in urls_found)
+    if is_turn_active:
+        st.success("✅ ใช้งาน Twilio TURN server อยู่")
+    else:
+        st.error(
+            "❌ ไม่พบ Twilio TURN server — กำลังใช้ STUN ของ Google อย่างเดียว "
+            "(เน็ตที่บล็อก UDP/มีไฟร์วอลล์เข้มจะเชื่อมต่อไม่ได้แน่นอน) "
+            "ตรวจสอบ TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN ใน Secrets"
+        )
+    st.code("\n".join(urls_found) or "ไม่มีข้อมูล", language="text")
 
 # เปิดใช้งาน WebRTC — ขอความละเอียด/เฟรมเรตต่ำลงจากกล้องผู้ใช้ เพื่อลดภาระ encode/decode/inference
 webrtc_ctx = webrtc_streamer(
