@@ -1,6 +1,8 @@
 streamlit
 numpy<2.0.0
 pandas
+opencv-python-headless
 ultralytics
 streamlit-webrtc
 twilio
+requests
