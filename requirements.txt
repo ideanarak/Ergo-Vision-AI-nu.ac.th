@@ -6,3 +6,4 @@ ultralytics
 streamlit-webrtc
 twilio
 requests
+streamlit-autorefresh
