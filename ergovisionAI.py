@@ -109,9 +109,20 @@ def init_db():
             duration_sec REAL NOT NULL,
             max_theta REAL,
             max_phi REAL,
+            min_neck_ratio_pct REAL,
+            cause TEXT,
             alert_triggered INTEGER NOT NULL
         )
     """)
+    # เผื่อกรณีฐานข้อมูลเก่ายังไม่มีคอลัมน์ใหม่ (สร้างจากโค้ดเวอร์ชันก่อนหน้า) - เพิ่มคอลัมน์แบบปลอดภัย
+    for ddl in (
+        "ALTER TABLE posture_events ADD COLUMN min_neck_ratio_pct REAL",
+        "ALTER TABLE posture_events ADD COLUMN cause TEXT",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # คอลัมน์มีอยู่แล้ว
     conn.commit()
     conn.close()
 
@@ -162,15 +173,17 @@ def authenticate_user(username: str, password: str) -> bool:
         conn.close()
 
 
-def log_posture_event(username, start_time, end_time, duration_sec, max_theta, max_phi, alert_triggered):
+def log_posture_event(username, start_time, end_time, duration_sec, max_theta, max_phi,
+                       min_neck_ratio_pct, cause, alert_triggered):
     conn = get_db_connection()
     try:
         conn.execute(
             "INSERT INTO posture_events "
-            "(username, start_time, end_time, duration_sec, max_theta, max_phi, alert_triggered) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(username, start_time, end_time, duration_sec, max_theta, max_phi, "
+            "min_neck_ratio_pct, cause, alert_triggered) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (username, start_time.isoformat(), end_time.isoformat(), duration_sec,
-             max_theta, max_phi, int(alert_triggered)),
+             max_theta, max_phi, min_neck_ratio_pct, cause, int(alert_triggered)),
         )
         conn.commit()
     finally:
@@ -216,6 +229,7 @@ class PostureTransformer(VideoTransformerBase):
     def __init__(self):
         self.theta_threshold = 5
         self.phi_threshold = 10
+        self.slouch_threshold_pct = 80  # ถ้าค่าปัจจุบันต่ำกว่า 80% ของท่านั่งตรงที่ calibrate ไว้ = ก้ม/หลังงอ
         self.alert_threshold_sec = 5  # ตั้งได้จาก sidebar แบบ real-time
 
         # --- ตัวแปรสำหรับลดภาระ CPU ---
@@ -231,8 +245,15 @@ class PostureTransformer(VideoTransformerBase):
         self.bad_since = None          # datetime ที่เริ่มนั่งผิดท่าในรอบปัจจุบัน
         self.current_theta = None
         self.current_phi = None
+        self.current_neck_ratio_pct = None   # % เทียบกับท่านั่งตรงที่ calibrate ไว้ (100% = ตรงเป๊ะ, ยิ่งน้อย = ยิ่งก้ม)
+        self.causes = []               # รายการสาเหตุที่ทำให้ท่านั่งผิด เช่น ["ไหล่เอียง", "ก้ม/หลังงอ"]
         self.episode_max_theta = None
         self.episode_max_phi = None
+        self.episode_min_neck_ratio_pct = None
+
+        # --- ค่าอ้างอิง "ท่านั่งตรง" สำหรับตรวจจับการก้ม (ต้อง calibrate ก่อนถึงจะตรวจได้) ---
+        self.calibrated_neck_ratio = None
+        self.request_calibration = False   # ตั้งจาก main thread เมื่อกดปุ่ม แล้วรอ frame ถัดไปมาบันทึกค่า
 
     def get_state(self):
         with self.state_lock:
@@ -241,9 +262,18 @@ class PostureTransformer(VideoTransformerBase):
                 "bad_since": self.bad_since,
                 "theta": self.current_theta,
                 "phi": self.current_phi,
+                "neck_ratio_pct": self.current_neck_ratio_pct,
+                "causes": list(self.causes),
+                "is_calibrated": self.calibrated_neck_ratio is not None,
                 "episode_max_theta": self.episode_max_theta,
                 "episode_max_phi": self.episode_max_phi,
+                "episode_min_neck_ratio_pct": self.episode_min_neck_ratio_pct,
             }
+
+    def calibrate(self):
+        """เรียกจาก main thread เมื่อผู้ใช้กดปุ่ม 'ตั้งค่าท่านั่งตรง' """
+        with self.state_lock:
+            self.request_calibration = True
 
     def _process(self, img):
         h, w = img.shape[:2]
@@ -265,6 +295,7 @@ class PostureTransformer(VideoTransformerBase):
             # แก้โดยแยกเช็คอิสระ: เห็นแค่ไหล่ก็ยังตรวจมุมเอียงไหล่ (θ) ได้ ไม่ต้องรอสะโพก
             has_shoulders = len(xy) > 6 and conf[5] > 0.3 and conf[6] > 0.3
             has_hips = len(xy) >= 13 and conf[11] > 0.3 and conf[12] > 0.3
+            has_nose = len(xy) > 0 and conf[0] > 0.3
 
             if has_shoulders:
                 lx, ly = xy[5]
@@ -277,7 +308,35 @@ class PostureTransformer(VideoTransformerBase):
                     r_hip_x, r_hip_y = xy[12]
                     phi = get_torso_tilt_phi(lx, ly, rx, ry, l_hip_x, l_hip_y, r_hip_x, r_hip_y)
 
-                is_bad_posture = (theta > self.theta_threshold) or (phi is not None and phi > self.phi_threshold)
+                # --- ตรวจการก้ม/หลังงอ ด้วยอัตราส่วนระยะจมูก-ไหล่ เทียบความกว้างไหล่ ---
+                # เวลาก้มหน้าเข้าจอ หัวจะขยับลงมาใกล้แนวไหล่มากขึ้น อัตราส่วนนี้จะลดลง
+                # หารด้วยความกว้างไหล่เพื่อชดเชยระยะห่างจากกล้อง (ยิ่งใกล้กล้อง ทุกอย่างจะใหญ่ขึ้นตามสัดส่วน)
+                neck_ratio_pct = None
+                if has_nose:
+                    nose_x, nose_y = xy[0]
+                    shoulder_mid_y = (ly + ry) / 2
+                    shoulder_width = max(abs(lx - rx), 1e-3)
+                    current_neck_ratio = abs(nose_y - shoulder_mid_y) / shoulder_width
+
+                    with self.state_lock:
+                        if self.request_calibration:
+                            self.calibrated_neck_ratio = current_neck_ratio
+                            self.request_calibration = False
+                        calibrated = self.calibrated_neck_ratio
+
+                    if calibrated:
+                        neck_ratio_pct = (current_neck_ratio / calibrated) * 100
+
+                slouch_bad = neck_ratio_pct is not None and neck_ratio_pct < self.slouch_threshold_pct
+
+                causes = []
+                if theta > self.theta_threshold:
+                    causes.append("ไหล่เอียง")
+                if phi is not None and phi > self.phi_threshold:
+                    causes.append("ตัวเอนข้าง")
+                if slouch_bad:
+                    causes.append("ก้ม/หลังงอ")
+                is_bad_posture = len(causes) > 0
 
                 cv2.putText(annotated_frame, f"Shoulder Tilt: {theta:.1f} deg", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
@@ -287,19 +346,33 @@ class PostureTransformer(VideoTransformerBase):
                 else:
                     cv2.putText(annotated_frame, "Torso Tilt: N/A (ไม่เห็นสะโพก)", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+                if neck_ratio_pct is not None:
+                    cv2.putText(annotated_frame, f"Neck Ratio: {neck_ratio_pct:.0f}% of upright", (10, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                else:
+                    cv2.putText(annotated_frame, "Neck Ratio: ยังไม่ calibrate", (10, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
 
                 with self.state_lock:
                     self.current_theta = theta
                     self.current_phi = phi
+                    self.current_neck_ratio_pct = neck_ratio_pct
+                    self.causes = causes
                     if is_bad_posture:
                         if not self.is_bad_posture:
                             self.bad_since = datetime.now()
                             self.episode_max_theta = theta
                             self.episode_max_phi = phi
+                            self.episode_min_neck_ratio_pct = neck_ratio_pct
                         else:
                             self.episode_max_theta = max(self.episode_max_theta, theta)
                             if phi is not None:
                                 self.episode_max_phi = max(self.episode_max_phi or 0, phi)
+                            if neck_ratio_pct is not None:
+                                prev_min = self.episode_min_neck_ratio_pct
+                                self.episode_min_neck_ratio_pct = (
+                                    neck_ratio_pct if prev_min is None else min(prev_min, neck_ratio_pct)
+                                )
                         self.is_bad_posture = True
                         bad_since = self.bad_since
                     else:
@@ -307,19 +380,21 @@ class PostureTransformer(VideoTransformerBase):
                         self.bad_since = None
                         self.episode_max_theta = None
                         self.episode_max_phi = None
+                        self.episode_min_neck_ratio_pct = None
                         bad_since = None
 
                 if is_bad_posture and bad_since is not None:
                     elapsed = (datetime.now() - bad_since).total_seconds()
+                    cause_text = ", ".join(causes)
                     if elapsed >= self.alert_threshold_sec:
-                        cv2.putText(annotated_frame, f"WARNING: BAD POSTURE > {int(elapsed)}s!", (10, 120),
+                        cv2.putText(annotated_frame, f"WARNING: {cause_text} > {int(elapsed)}s!", (10, 150),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
                     else:
                         cv2.putText(annotated_frame,
-                                    f"Warning ({int(elapsed)}/{self.alert_threshold_sec}s)", (10, 120),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 165, 255), 2)
+                                    f"Warning: {cause_text} ({int(elapsed)}/{self.alert_threshold_sec}s)", (10, 150),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
                 else:
-                    cv2.putText(annotated_frame, "Good Posture", (10, 120),
+                    cv2.putText(annotated_frame, "Good Posture", (10, 150),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
             else:
                 cv2.putText(annotated_frame, "ไม่เห็นไหล่ชัดเจน - ขยับให้เข้ากล้อง", (10, 120),
@@ -433,6 +508,8 @@ for key, default in [
     ("alert_fired", False),
     ("episode_max_theta", None),
     ("episode_max_phi", None),
+    ("episode_min_neck_ratio_pct", None),
+    ("episode_causes", []),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -449,6 +526,11 @@ if st.sidebar.button("ออกจากระบบ"):
 st.sidebar.header("⚙️ ตั้งค่าความไวการแจ้งเตือน")
 theta_slider = st.sidebar.slider('ไหล่เอียงสูงสุด (θ)', 1, 15, 5)
 phi_slider = st.sidebar.slider('ตัวเอนสูงสุด (φ)', 1, 20, 10)
+slouch_slider = st.sidebar.slider(
+    'ความไวการตรวจจับก้ม/หลังงอ (% ของท่านั่งตรง)', 50, 95, 80,
+    help="ถ้าค่าปัจจุบันต่ำกว่า % นี้ของท่านั่งตรงที่ calibrate ไว้ จะถือว่าก้ม/หลังงอ "
+         "ตั้งสูง (เช่น 90%) = ไวมาก ก้มนิดเดียวก็จับได้ / ตั้งต่ำ (เช่น 60%) = ต้องก้มเยอะถึงจะจับ"
+)
 alert_threshold_slider = st.sidebar.slider(
     'แจ้งเตือน (เสียง+ข้อความ) เมื่อนั่งผิดท่านานกว่า (วินาที)', 1, 60, 5
 )
@@ -515,6 +597,7 @@ with tab_camera:
     if webrtc_ctx.video_processor:
         webrtc_ctx.video_processor.theta_threshold = theta_slider
         webrtc_ctx.video_processor.phi_threshold = phi_slider
+        webrtc_ctx.video_processor.slouch_threshold_pct = slouch_slider
         webrtc_ctx.video_processor.alert_threshold_sec = alert_threshold_slider
 
     st.info("💡 หมายเหตุ: หากใช้งานบนมือถือ ให้ตรวจสอบว่าอนุญาตสิทธิ์ใช้งานกล้องผ่านเบราว์เซอร์แล้ว")
@@ -524,6 +607,19 @@ with tab_camera:
             "หากกดเริ่มแล้วภาพไม่ขึ้นภายใน ~10 วินาที ให้เปิด sidebar > 🔍 ตรวจสอบสถานะ ICE Server "
             "เพื่อดูว่าใช้ TURN จากแหล่งไหนอยู่ และลองเปิด/ปิด 'บังคับใช้ TURN relay อย่างเดียว' เพื่อทดสอบ"
         )
+
+    calib_col1, calib_col2 = st.columns([1, 3])
+    with calib_col1:
+        calibrate_clicked = st.button("📐 ตั้งค่าท่านั่งตรง", use_container_width=True,
+                                       disabled=not webrtc_ctx.state.playing)
+    with calib_col2:
+        st.caption(
+            "นั่งหลังตรง มองตรงเข้าจอ แล้วกดปุ่มนี้หนึ่งครั้ง เพื่อบันทึกเป็นค่าอ้างอิงสำหรับตรวจจับการก้ม/หลังงอ "
+            "(ต้องกดใหม่ทุกครั้งที่เปิดแอป หรือถ้าขยับเก้าอี้/กล้อง)"
+        )
+    if calibrate_clicked and webrtc_ctx.video_processor:
+        webrtc_ctx.video_processor.calibrate()
+        st.toast("✅ บันทึกท่านั่งตรงเป็นค่าอ้างอิงแล้ว", icon="📐")
 
     alert_placeholder = st.empty()
     metrics_placeholder = st.empty()
@@ -536,16 +632,22 @@ with tab_camera:
         if webrtc_ctx.video_processor:
             state = webrtc_ctx.video_processor.get_state()
 
-            # แสดงค่ามุมที่วัดได้จริงแบบ real-time ในหน้าเว็บ (ไม่ใช่แค่บนวิดีโอตัวเล็กๆ)
-            # ใช้สำหรับปรับ slider ไหล่เอียง/ตัวเอน ให้เหมาะกับกล้องและระยะนั่งจริงของแต่ละคน
+            # แสดงค่าที่วัดได้จริงแบบ real-time ในหน้าเว็บ (ไม่ใช่แค่บนวิดีโอตัวเล็กๆ)
+            # ใช้สำหรับปรับ slider ให้เหมาะกับกล้องและระยะนั่งจริงของแต่ละคน
             with metrics_placeholder.container():
-                mc1, mc2 = st.columns(2)
+                mc1, mc2, mc3 = st.columns(3)
                 theta_val = state["theta"]
                 phi_val = state["phi"]
-                mc1.metric("มุมเอียงไหล่ที่วัดได้ (θ)",
+                neck_val = state["neck_ratio_pct"]
+                mc1.metric("มุมเอียงไหล่ (θ)",
                            f"{theta_val:.1f}°" if theta_val is not None else "—")
-                mc2.metric("มุมเอนตัวที่วัดได้ (φ)",
+                mc2.metric("มุมเอนตัว (φ)",
                            f"{phi_val:.1f}°" if phi_val is not None else "N/A (ไม่เห็นสะโพก)")
+                if state["is_calibrated"]:
+                    mc3.metric("ระดับก้ม (% ของท่าตรง)",
+                               f"{neck_val:.0f}%" if neck_val is not None else "—")
+                else:
+                    mc3.metric("ระดับก้ม (% ของท่าตรง)", "ยังไม่ calibrate")
 
             if state["is_bad_posture"]:
                 if st.session_state.episode_start is None:
@@ -555,17 +657,20 @@ with tab_camera:
                 elapsed = (datetime.now() - st.session_state.episode_start).total_seconds()
                 st.session_state.episode_max_theta = state["episode_max_theta"]
                 st.session_state.episode_max_phi = state["episode_max_phi"]
+                st.session_state.episode_min_neck_ratio_pct = state["episode_min_neck_ratio_pct"]
+                st.session_state.episode_causes = state["causes"]
+                cause_text = " / ".join(state["causes"]) or "ท่านั่งผิดปกติ"
 
                 if elapsed >= alert_threshold_slider:
                     if not st.session_state.alert_fired:
                         st.session_state.alert_fired = True
                         play_alert_sound()
                     alert_placeholder.error(
-                        f"🚨 นั่งผิดท่ามานาน {int(elapsed)} วินาทีแล้ว! กรุณาปรับท่านั่งให้ถูกต้อง"
+                        f"🚨 {cause_text} มานาน {int(elapsed)} วินาทีแล้ว! กรุณาปรับท่านั่งให้ถูกต้อง"
                     )
                 else:
                     alert_placeholder.warning(
-                        f"⚠️ ท่านั่งเริ่มผิดปกติ ({int(elapsed)}/{alert_threshold_slider} วินาที)"
+                        f"⚠️ ท่านั่งเริ่มผิดปกติ: {cause_text} ({int(elapsed)}/{alert_threshold_slider} วินาที)"
                     )
             else:
                 if st.session_state.episode_start is not None:
@@ -579,6 +684,8 @@ with tab_camera:
                             duration,
                             st.session_state.episode_max_theta,
                             st.session_state.episode_max_phi,
+                            st.session_state.episode_min_neck_ratio_pct,
+                            ", ".join(st.session_state.get("episode_causes", [])) or None,
                             st.session_state.alert_fired,
                         )
                     st.session_state.episode_start = None
@@ -619,15 +726,22 @@ with tab_stats:
         st.bar_chart(daily)
 
         st.markdown("**รายละเอียดล่าสุด**")
-        display_df = df[["start_time", "duration_sec", "max_theta", "max_phi", "alert_triggered"]].copy()
+        display_df = df[["start_time", "duration_sec", "max_theta", "max_phi",
+                          "min_neck_ratio_pct", "cause", "alert_triggered"]].copy()
         display_df["duration_sec"] = pd.to_numeric(display_df["duration_sec"], errors="coerce").round(1)
         display_df["max_theta"] = pd.to_numeric(display_df["max_theta"], errors="coerce").round(1)
-        # max_phi อาจเป็นค่าว่าง (None) ได้ในแถวที่กล้องมองไม่เห็นสะโพก (เห็นแค่ไหล่)
+        # max_phi / min_neck_ratio_pct อาจเป็นค่าว่าง (None) ได้ในแถวที่กล้องมองไม่เห็นสะโพก/ยังไม่ calibrate
         # ต้อง coerce เป็นตัวเลขก่อน ไม่งั้น .round() จะพังตอนคอลัมน์มีทั้ง None ปนกับ float
         display_df["max_phi"] = pd.to_numeric(display_df["max_phi"], errors="coerce").round(1)
         display_df["max_phi"] = display_df["max_phi"].apply(lambda v: f"{v}" if pd.notna(v) else "N/A")
+        display_df["min_neck_ratio_pct"] = pd.to_numeric(display_df["min_neck_ratio_pct"], errors="coerce").round(0)
+        display_df["min_neck_ratio_pct"] = display_df["min_neck_ratio_pct"].apply(
+            lambda v: f"{v:.0f}%" if pd.notna(v) else "N/A"
+        )
+        display_df["cause"] = display_df["cause"].fillna("—")
         display_df["alert_triggered"] = display_df["alert_triggered"].map({1: "✅", 0: "—"})
-        display_df.columns = ["เวลาเริ่ม", "ระยะเวลา (วินาที)", "ไหล่เอียงสูงสุด (°)", "ตัวเอนสูงสุด (°)", "แจ้งเตือน"]
+        display_df.columns = ["เวลาเริ่ม", "ระยะเวลา (วินาที)", "ไหล่เอียงสูงสุด (°)", "ตัวเอนสูงสุด (°)",
+                               "ก้มมากสุด (% ของท่าตรง)", "สาเหตุ", "แจ้งเตือน"]
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     st.caption(
