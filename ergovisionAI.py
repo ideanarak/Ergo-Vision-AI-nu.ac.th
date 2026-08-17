@@ -25,33 +25,61 @@ def load_yolo_model():
 model = load_yolo_model()
 
 # ==========================================
-# 2. ดึงค่า TURN Server จาก Twilio
+# 2. ดึงค่า TURN Server (ลำดับ: Twilio -> Metered -> Open Relay ฟรี -> Google STUN)
 # ==========================================
+# Open Relay Project: TURN server สาธารณะฟรี ไม่ต้องสมัครสมาชิก ใช้ได้ทันที
+# รองรับ TURN ผ่านพอร์ต 443/TCP ซึ่งทะลุไฟร์วอลล์ที่บล็อก UDP ได้ (เช่นเน็ตมหาวิทยาลัย)
+# หมายเหตุ: เป็น resource สาธารณะที่ทุกคนแชร์กัน ความเร็ว/ความเสถียรจะสู้บัญชีของตัวเองไม่ได้
+# ถ้าจะใช้งานจริงจัง แนะนำให้สมัคร Metered ฟรี (20GB/เดือน) แทน ดูวิธีได้ที่ metered.ca/tools/openrelay
+OPEN_RELAY_ICE_SERVERS = [
+    {"urls": "stun:stun.relay.metered.ca:80"},
+    {"urls": "turn:openrelay.metered.ca:80", "username": "openrelayproject", "credential": "openrelayproject"},
+    {"urls": "turn:openrelay.metered.ca:443", "username": "openrelayproject", "credential": "openrelayproject"},
+    {"urls": "turn:openrelay.metered.ca:443?transport=tcp", "username": "openrelayproject", "credential": "openrelayproject"},
+]
+
 # สำคัญ: ต้องใส่ ttl ให้ cache หมดอายุก่อน token ของ Twilio (ปกติ token อยู่ได้ไม่กี่ชม.)
 # ถ้าไม่ตั้ง ttl แอปจะยังใช้ token เก่าที่หมดอายุไปเรื่อยๆ ทำให้ต่อกล้องไม่ติดแบบเงียบๆ
 @st.cache_data(ttl=3000)  # รีเฟรชทุก 50 นาที
 def get_ice_servers():
-    """คืนค่า (ice_servers, error_message)
-    error_message เป็น None ถ้าดึงจาก Twilio สำเร็จ, เป็น string ของ error จริงถ้าไม่สำเร็จ
+    """คืนค่า (ice_servers, error_message, source)
+    source บอกว่าใช้ TURN จากที่ไหน: 'twilio' / 'metered' / 'openrelay' / 'stun-only'
     (ไม่ใช้ st.warning() ในนี้ เพราะฟังก์ชันถูก cache — ข้อความจะไม่โชว์ซ้ำตอน cache hit)
     """
-    if "TWILIO_ACCOUNT_SID" not in st.secrets or "TWILIO_AUTH_TOKEN" not in st.secrets:
-        return (
-            [{"urls": ["stun:stun.l.google.com:19302"]}],
-            "ไม่พบ TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN ใน st.secrets เลย "
-            "แปลว่ายังไม่ได้ตั้งค่าใน Streamlit Cloud > Settings > Secrets "
-            "หรือชื่อ key พิมพ์ผิด/ใส่ผิด section",
-        )
+    errors = []
 
-    try:
-        account_sid = st.secrets["TWILIO_ACCOUNT_SID"]
-        auth_token = st.secrets["TWILIO_AUTH_TOKEN"]
+    # --- ลำดับที่ 1: Twilio (ถ้าตั้งค่าไว้และบัญชีใช้งานได้) ---
+    if "TWILIO_ACCOUNT_SID" in st.secrets and "TWILIO_AUTH_TOKEN" in st.secrets:
+        try:
+            client = Client(st.secrets["TWILIO_ACCOUNT_SID"], st.secrets["TWILIO_AUTH_TOKEN"])
+            token = client.tokens.create()
+            return token.ice_servers, None, "twilio"
+        except Exception as e:
+            errors.append(f"Twilio: {type(e).__name__}: {e}")
+    else:
+        errors.append("Twilio: ไม่ได้ตั้งค่า secrets")
 
-        client = Client(account_sid, auth_token)
-        token = client.tokens.create()
-        return token.ice_servers, None
-    except Exception as e:
-        return [{"urls": ["stun:stun.l.google.com:19302"]}], f"{type(e).__name__}: {e}"
+    # --- ลำดับที่ 2: Metered (ถ้าสมัครแล้วตั้ง secrets ไว้) ---
+    if "METERED_API_KEY" in st.secrets and "METERED_APP_NAME" in st.secrets:
+        try:
+            import requests
+            app_name = st.secrets["METERED_APP_NAME"]
+            api_key = st.secrets["METERED_API_KEY"]
+            resp = requests.get(
+                f"https://{app_name}.metered.live/api/v1/turn/credentials",
+                params={"apiKey": api_key},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json(), None, "metered"
+        except Exception as e:
+            errors.append(f"Metered: {type(e).__name__}: {e}")
+    else:
+        errors.append("Metered: ไม่ได้ตั้งค่า METERED_API_KEY / METERED_APP_NAME")
+
+    # --- ลำดับที่ 3: Open Relay ฟรี (ใช้ได้ทันที ไม่ต้อง setup) ---
+    errors.append("ใช้ Open Relay TURN สาธารณะแทน (ฟรี ไม่ต้องสมัคร แต่เป็นทรัพยากรที่แชร์กับคนอื่น)")
+    return OPEN_RELAY_ICE_SERVERS, " | ".join(errors), "openrelay"
 
 # ==========================================
 # 3. ฟังก์ชันคำนวณคณิตศาสตร์
@@ -177,16 +205,21 @@ force_turn_relay = st.sidebar.checkbox(
          "ทำให้ไฟร์วอลล์ไม่บล็อก และยังเชื่อมต่อได้เร็วกว่าด้วย เพราะข้ามขั้นตอนลองต่อ P2P ที่มักจะ timeout ก่อนบนเน็ตแบบนี้"
 )
 
-# ตั้งค่าเซิร์ฟเวอร์ด้วย Twilio
-ice_servers, ice_error = get_ice_servers()
+# ตั้งค่าเซิร์ฟเวอร์ TURN/STUN
+ice_servers, ice_error, ice_source = get_ice_servers()
 
 rtc_config_dict = {"iceServers": ice_servers, "iceCandidatePoolSize": 10}
 if force_turn_relay:
     rtc_config_dict["iceTransportPolicy"] = "relay"
 rtc_config = RTCConfiguration(rtc_config_dict)
 
-# --- Debug panel: เช็คว่ากำลังใช้ Twilio TURN จริง หรือ fallback เป็น Google STUN ---
-with st.sidebar.expander("🔍 ตรวจสอบสถานะ ICE Server", expanded=(ice_error is not None)):
+# --- Debug panel: เช็คว่ากำลังใช้ TURN จากแหล่งไหน ---
+SOURCE_LABEL = {
+    "twilio": "✅ Twilio TURN (บัญชีตัวเอง)",
+    "metered": "✅ Metered TURN (บัญชีตัวเอง)",
+    "openrelay": "🟡 Open Relay TURN สาธารณะ (ฟรี ใช้ได้ทันที แต่แชร์กับคนอื่น)",
+}
+with st.sidebar.expander("🔍 ตรวจสอบสถานะ ICE Server", expanded=(ice_source != "twilio")):
     urls_found = []
     for s in ice_servers:
         u = s.get("urls") if isinstance(s, dict) else getattr(s, "urls", None)
@@ -195,16 +228,9 @@ with st.sidebar.expander("🔍 ตรวจสอบสถานะ ICE Server",
         elif u:
             urls_found.append(u)
 
-    is_turn_active = any("turn" in u for u in urls_found)
-    if is_turn_active:
-        st.success("✅ ใช้งาน Twilio TURN server อยู่")
-    else:
-        st.error(
-            "❌ ไม่พบ Twilio TURN server — กำลังใช้ STUN ของ Google อย่างเดียว "
-            "(เน็ตที่บล็อก UDP/มีไฟร์วอลล์เข้มจะเชื่อมต่อไม่ได้แน่นอน)"
-        )
+    st.markdown(f"**แหล่ง TURN ที่ใช้อยู่:** {SOURCE_LABEL.get(ice_source, ice_source)}")
     if ice_error:
-        st.caption("รายละเอียด error จาก Twilio:")
+        st.caption("รายละเอียด (ทำไมไม่ได้ใช้ Twilio/Metered):")
         st.code(ice_error, language="text")
     st.caption("ICE server URLs ที่ใช้งานอยู่:")
     st.code("\n".join(urls_found) or "ไม่มีข้อมูล", language="text")
@@ -235,7 +261,6 @@ st.info("💡 หมายเหตุ: หากใช้งานบนมื�
 
 if webrtc_ctx.state.playing is False and webrtc_ctx.state.signalling is False:
     st.warning(
-        "หากกดเริ่มแล้วภาพไม่ขึ้นภายใน ~10 วินาที มักเกิดจากเครือข่ายของคุณบล็อกการเชื่อมต่อ WebRTC "
-        "และไม่มี TURN server ใช้งานได้ (ตรวจสอบว่าตั้งค่า TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN "
-        "ใน Streamlit Cloud > Settings > Secrets ถูกต้องแล้ว)"
+        "หากกดเริ่มแล้วภาพไม่ขึ้นภายใน ~10 วินาที ให้เปิด sidebar > 🔍 ตรวจสอบสถานะ ICE Server "
+        "เพื่อดูว่าใช้ TURN จากแหล่งไหนอยู่ และลองเปิด/ปิด 'บังคับใช้ TURN relay อย่างเดียว' เพื่อทดสอบ"
     )
