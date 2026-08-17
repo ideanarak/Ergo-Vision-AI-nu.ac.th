@@ -620,9 +620,12 @@ with tab_stats:
 
         st.markdown("**รายละเอียดล่าสุด**")
         display_df = df[["start_time", "duration_sec", "max_theta", "max_phi", "alert_triggered"]].copy()
-        display_df["duration_sec"] = display_df["duration_sec"].round(1)
-        display_df["max_theta"] = display_df["max_theta"].round(1)
-        display_df["max_phi"] = display_df["max_phi"].round(1)
+        display_df["duration_sec"] = pd.to_numeric(display_df["duration_sec"], errors="coerce").round(1)
+        display_df["max_theta"] = pd.to_numeric(display_df["max_theta"], errors="coerce").round(1)
+        # max_phi อาจเป็นค่าว่าง (None) ได้ในแถวที่กล้องมองไม่เห็นสะโพก (เห็นแค่ไหล่)
+        # ต้อง coerce เป็นตัวเลขก่อน ไม่งั้น .round() จะพังตอนคอลัมน์มีทั้ง None ปนกับ float
+        display_df["max_phi"] = pd.to_numeric(display_df["max_phi"], errors="coerce").round(1)
+        display_df["max_phi"] = display_df["max_phi"].apply(lambda v: f"{v}" if pd.notna(v) else "N/A")
         display_df["alert_triggered"] = display_df["alert_triggered"].map({1: "✅", 0: "—"})
         display_df.columns = ["เวลาเริ่ม", "ระยะเวลา (วินาที)", "ไหล่เอียงสูงสุด (°)", "ตัวเอนสูงสุด (°)", "แจ้งเตือน"]
         st.dataframe(display_df, use_container_width=True, hide_index=True)
