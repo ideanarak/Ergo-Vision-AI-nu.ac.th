@@ -161,9 +161,15 @@ st.set_page_config(page_title="Ergo-Vision AI", layout="wide")
 conn = init_db()
 
 # ตั้งค่าเซิร์ฟเวอร์สำหรับ WebRTC (จำเป็นสำหรับ Cloud)
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
+RTC_CONFIGURATION = RTCConfiguration({
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+        {"urls": ["stun:stun2.l.google.com:19302"]},
+        {"urls": ["stun:stun3.l.google.com:19302"]},
+        {"urls": ["stun:stun4.l.google.com:19302"]},
+    ]
+})
 
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
