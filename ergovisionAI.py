@@ -161,7 +161,7 @@ else:
         st.sidebar.header("⚙️ ตั้งค่าการตรวจจับ")
         run = st.sidebar.checkbox('🟢 เปิดใช้งานระบบตรวจจับ', value=True)
         
-        # กำหนดกล้องหลักเป็น 0 ทันที โดยไม่ต้องให้ผู้ใช้เลือก
+        # กำหนดกล้องหลักเป็น 0 ทันที 
         camera_id = 0
         
         st.sidebar.markdown("---")
@@ -179,88 +179,106 @@ else:
             metric_box2 = st.empty()
 
         if run:
-            # เปิดกล้องโดยรองรับทั้ง Windows และ Linux
+            # ---------------------------------------------------------
+            # 🔧 ปรับปรุงระบบการเปิดกล้องให้รัดกุมขึ้น
+            # ---------------------------------------------------------
+            cap = None
             if is_windows:
-                cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
+                # วิธีที่ 1: ลองเปิดแบบปกติก่อน
+                cap = cv2.VideoCapture(camera_id)
+                if not cap.isOpened():
+                    # วิธีที่ 2: ถ้าไม่ได้ ให้ลองใช้ CAP_DSHOW เป็นทางเลือกสำรอง
+                    cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
             else:
                 cap = cv2.VideoCapture(camera_id)
-                
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-            if not cap.isOpened():
-                st.error("⚠️ ไม่สามารถเปิดกล้องได้ โปรดตรวจสอบการเชื่อมต่อกล้อง")
+            if cap is None or not cap.isOpened():
+                st.error("⚠️ ไม่สามารถเปิดกล้องได้!")
+                st.info("💡 คำแนะนำเบื้องต้น:\n"
+                        "1. หากเพิ่งปิดแอปไปเมื่อกี้ ให้ลอง ปิด Terminal แล้วรัน `streamlit run ...` ใหม่\n"
+                        "2. ตรวจสอบว่าแอปอื่น (เช่น Zoom, Meet) กำลังใช้กล้องอยู่หรือไม่\n"
+                        "3. หากรันบน Cloud (Streamlit Community Cloud) จะไม่สามารถดึงกล้องคอมพิวเตอร์ของคุณด้วยวิธีนี้ได้ ต้องรันแบบ Local เท่านั้น")
             else:
+                # บังคับความละเอียดเพื่อลดภาระเครื่อง
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 save_counter = 0
-                while run:
-                    ret, frame = cap.read()
-                    if not ret:
-                        time.sleep(0.1)
-                        continue
 
-                    frame = cv2.flip(frame, 1)
-                    results = model(frame, verbose=False)
-                    annotated_frame = results[0].plot()
-                    image_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                try:
+                    while run:
+                        ret, frame = cap.read()
+                        if not ret:
+                            # บางครั้งกล้องวอร์มอัพไม่ทัน ให้รอสักครู่แล้วลองดึงภาพใหม่
+                            time.sleep(0.1)
+                            continue
 
-                    keypoints = results[0].keypoints
-                    if keypoints is not None and len(keypoints.xy) > 0:
-                        xy = keypoints.xy[0].cpu().numpy()
-                        conf = keypoints.conf[0].cpu().numpy()
+                        frame = cv2.flip(frame, 1)
+                        results = model(frame, verbose=False)
+                        annotated_frame = results[0].plot()
+                        image_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
 
-                        if len(xy) >= 13 and conf[5] > 0.3 and conf[6] > 0.3 and conf[11] > 0.3 and conf[12] > 0.3:
-                            lx, ly = xy[5]
-                            rx, ry = xy[6]
-                            l_hip_x, l_hip_y = xy[11]
-                            r_hip_x, r_hip_y = xy[12]
+                        # --- ส่วนของการคำนวณและแจ้งเตือน ---
+                        keypoints = results[0].keypoints
+                        if keypoints is not None and len(keypoints.xy) > 0:
+                            xy = keypoints.xy[0].cpu().numpy()
+                            conf = keypoints.conf[0].cpu().numpy()
 
-                            theta = get_shoulder_tilt_theta(lx, ly, rx, ry)
-                            phi = get_torso_tilt_phi(lx, ly, rx, ry, l_hip_x, l_hip_y, r_hip_x, r_hip_y)
+                            if len(xy) >= 13 and conf[5] > 0.3 and conf[6] > 0.3 and conf[11] > 0.3 and conf[12] > 0.3:
+                                lx, ly = xy[5]
+                                rx, ry = xy[6]
+                                l_hip_x, l_hip_y = xy[11]
+                                r_hip_x, r_hip_y = xy[12]
 
-                            is_bad_posture = (theta > theta_threshold) or (phi > phi_threshold)
+                                theta = get_shoulder_tilt_theta(lx, ly, rx, ry)
+                                phi = get_torso_tilt_phi(lx, ly, rx, ry, l_hip_x, l_hip_y, r_hip_x, r_hip_y)
 
-                            if is_bad_posture:
-                                if st.session_state.bad_posture_start_time is None:
-                                    st.session_state.bad_posture_start_time = time.time()
+                                is_bad_posture = (theta > theta_threshold) or (phi > phi_threshold)
 
-                                elapsed_time = time.time() - st.session_state.bad_posture_start_time
+                                if is_bad_posture:
+                                    if st.session_state.bad_posture_start_time is None:
+                                        st.session_state.bad_posture_start_time = time.time()
 
-                                if elapsed_time >= 10:
-                                    status_box.error(f"🚨 ระวัง! นั่งผิดท่ามา {int(elapsed_time)} วินาทีแล้ว 🔊")
-                                    st.toast('🚨 นั่งผิดท่าเกิน 10 วินาทีแล้ว! กรุณายืดตัวตรง', icon='⚠️')
-                                    
-                                    # แจ้งเตือนเฉพาะบน Windows
-                                    if is_windows:
-                                        winsound.PlaySound("SystemHand", winsound.SND_ALIAS | winsound.SND_ASYNC)
-                                        try:
-                                            notification.notify(
-                                                title="⚠️ แจ้งเตือนจาก Ergo-Vision AI",
-                                                message="คุณนั่งผิดท่าเกิน 10 วินาทีแล้ว กรุณาปรับท่านั่งครับ!",
-                                                app_name="Ergo-Vision",
-                                                timeout=2
-                                            )
-                                        except Exception:
-                                            pass
+                                    elapsed_time = time.time() - st.session_state.bad_posture_start_time
 
-                                    st.session_state.bad_posture_start_time = time.time() - 7
+                                    if elapsed_time >= 10:
+                                        status_box.error(f"🚨 ระวัง! นั่งผิดท่ามา {int(elapsed_time)} วินาทีแล้ว 🔊")
+                                        st.toast('🚨 นั่งผิดท่าเกิน 10 วินาทีแล้ว! กรุณายืดตัวตรง', icon='⚠️')
+                                        
+                                        # แจ้งเตือนเฉพาะบน Windows
+                                        if is_windows:
+                                            winsound.PlaySound("SystemHand", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                                            try:
+                                                notification.notify(
+                                                    title="⚠️ แจ้งเตือนจาก Ergo-Vision AI",
+                                                    message="คุณนั่งผิดท่าเกิน 10 วินาทีแล้ว กรุณาปรับท่านั่งครับ!",
+                                                    app_name="Ergo-Vision",
+                                                    timeout=2
+                                                )
+                                            except Exception:
+                                                pass
+
+                                        st.session_state.bad_posture_start_time = time.time() - 7
+                                    else:
+                                        status_box.warning(f"⚠️ ระวัง! นั่งผิดท่า ({int(elapsed_time)}/10 วิ)")
                                 else:
-                                    status_box.warning(f"⚠️ ระวัง! นั่งผิดท่า ({int(elapsed_time)}/10 วิ)")
-                            else:
-                                st.session_state.bad_posture_start_time = None
-                                status_box.success("✅ ท่านั่งสมดุลดีเยี่ยม")
+                                    st.session_state.bad_posture_start_time = None
+                                    status_box.success("✅ ท่านั่งสมดุลดีเยี่ยม")
 
-                        metric_box1.metric("มุมไหล่เอียง (θ)", f"{theta:.1f}°")
-                        metric_box2.metric("มุมตัวเอน (φ)", f"{phi:.1f}°")
+                                metric_box1.metric("มุมไหล่เอียง (θ)", f"{theta:.1f}°")
+                                metric_box2.metric("มุมตัวเอน (φ)", f"{phi:.1f}°")
 
-                        save_counter += 1
-                        if save_counter >= 30:
-                            save_to_db(conn, st.session_state.username, theta, phi, "ผิดปกติ" if is_bad_posture else "ปกติ")
-                            save_counter = 0
+                                save_counter += 1
+                                if save_counter >= 30:
+                                    save_to_db(conn, st.session_state.username, theta, phi, "ผิดปกติ" if is_bad_posture else "ปกติ")
+                                    save_counter = 0
 
-                    FRAME_WINDOW.image(image_rgb)
-                    time.sleep(0.01) 
-                    
-                cap.release()
+                        FRAME_WINDOW.image(image_rgb)
+                        time.sleep(0.01) 
+                        
+                finally:
+                    # ป้องกันการเกิดกล้องค้าง ด้วยการบังคับคลายกล้องคืนระบบเสมอ
+                    if cap is not None:
+                        cap.release()
 
     with tab2:
         st.header(f"📂 ประวัติและแนวโน้มการนั่งของคุณ {st.session_state.username}")
