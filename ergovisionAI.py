@@ -8,7 +8,8 @@ from datetime import datetime
 from ultralytics import YOLO
 import time
 from twilio.rest import Client
-from streamlit_webrtc import webrtc_streamer, RTCConfiguration, VideoTransformerBase
+# แก้ไขบรรทัดนี้
+from streamlit_webrtc import webrtc_streamer, RTCConfiguration, VideoTransformerBase, WebRtcMode
 import av
 
 # ==========================================
@@ -118,9 +119,10 @@ phi_slider = st.sidebar.slider('ตัวเอนสูงสุด (φ)', 1, 2
 rtc_config = RTCConfiguration({"iceServers": get_ice_servers()})
 
 # เปิดใช้งาน WebRTC
+# เปลี่ยนจาก mode=1 เป็นแบบนี้ครับ
 webrtc_ctx = webrtc_streamer(
     key="ergo-posture-webrtc",
-    mode=1, # SENDRECV (ส่งและรับวิดีโอ)
+    mode=WebRtcMode.SENDRECV,  # <--- แก้ไขตรงนี้ครับ
     rtc_configuration=rtc_config,
     video_processor_factory=PostureTransformer,
     media_stream_constraints={"video": True, "audio": False},
