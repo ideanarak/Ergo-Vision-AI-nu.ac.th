@@ -259,20 +259,34 @@ class PostureTransformer(VideoTransformerBase):
             xy = keypoints.xy[0].cpu().numpy()
             conf = keypoints.conf[0].cpu().numpy()
 
-            if len(xy) >= 13 and all(c > 0.3 for c in conf[[5, 6, 11, 12]]):
+            # เดิมโค้ดเช็คว่าต้องเห็นครบ 4 จุด (ไหล่ซ้าย-ขวา + สะโพกซ้าย-ขวา) พร้อมกันถึงจะประมวลผล
+            # แต่กล้อง webcam ที่วางบนจอ/แล็ปท็อปตอนนั่งทำงาน มักเห็นแค่ช่วงไหล่ขึ้นไป ไม่เห็นสะโพกเลย
+            # ทำให้เงื่อนไขนี้ไม่ผ่านตลอด สถานะเลยค้างที่ "ท่านั่งถูกต้อง" (ค่าเริ่มต้น) แม้จะเอียงจริง
+            # แก้โดยแยกเช็คอิสระ: เห็นแค่ไหล่ก็ยังตรวจมุมเอียงไหล่ (θ) ได้ ไม่ต้องรอสะโพก
+            has_shoulders = len(xy) > 6 and conf[5] > 0.3 and conf[6] > 0.3
+            has_hips = len(xy) >= 13 and conf[11] > 0.3 and conf[12] > 0.3
+
+            if has_shoulders:
                 lx, ly = xy[5]
                 rx, ry = xy[6]
-                l_hip_x, l_hip_y = xy[11]
-                r_hip_x, r_hip_y = xy[12]
-
                 theta = get_shoulder_tilt_theta(lx, ly, rx, ry)
-                phi = get_torso_tilt_phi(lx, ly, rx, ry, l_hip_x, l_hip_y, r_hip_x, r_hip_y)
-                is_bad_posture = (theta > self.theta_threshold) or (phi > self.phi_threshold)
+
+                phi = None
+                if has_hips:
+                    l_hip_x, l_hip_y = xy[11]
+                    r_hip_x, r_hip_y = xy[12]
+                    phi = get_torso_tilt_phi(lx, ly, rx, ry, l_hip_x, l_hip_y, r_hip_x, r_hip_y)
+
+                is_bad_posture = (theta > self.theta_threshold) or (phi is not None and phi > self.phi_threshold)
 
                 cv2.putText(annotated_frame, f"Shoulder Tilt: {theta:.1f} deg", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                cv2.putText(annotated_frame, f"Torso Tilt: {phi:.1f} deg", (10, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                if phi is not None:
+                    cv2.putText(annotated_frame, f"Torso Tilt: {phi:.1f} deg", (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                else:
+                    cv2.putText(annotated_frame, "Torso Tilt: N/A (ไม่เห็นสะโพก)", (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
 
                 with self.state_lock:
                     self.current_theta = theta
@@ -284,7 +298,8 @@ class PostureTransformer(VideoTransformerBase):
                             self.episode_max_phi = phi
                         else:
                             self.episode_max_theta = max(self.episode_max_theta, theta)
-                            self.episode_max_phi = max(self.episode_max_phi, phi)
+                            if phi is not None:
+                                self.episode_max_phi = max(self.episode_max_phi or 0, phi)
                         self.is_bad_posture = True
                         bad_since = self.bad_since
                     else:
@@ -306,6 +321,9 @@ class PostureTransformer(VideoTransformerBase):
                 else:
                     cv2.putText(annotated_frame, "Good Posture", (10, 120),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            else:
+                cv2.putText(annotated_frame, "ไม่เห็นไหล่ชัดเจน - ขยับให้เข้ากล้อง", (10, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
         return annotated_frame
 
@@ -508,6 +526,7 @@ with tab_camera:
         )
 
     alert_placeholder = st.empty()
+    metrics_placeholder = st.empty()
 
     # โพลสถานะทุก 1 วินาทีเพื่อแจ้งเตือนแบบ real-time และบันทึกสถิติ
     # (ทำงานเฉพาะตอนกล้องกำลังเล่นอยู่ เพื่อไม่ให้ auto-refresh รันทิ้งเปล่าๆ ตอนยังไม่เปิดกล้อง)
@@ -516,6 +535,17 @@ with tab_camera:
 
         if webrtc_ctx.video_processor:
             state = webrtc_ctx.video_processor.get_state()
+
+            # แสดงค่ามุมที่วัดได้จริงแบบ real-time ในหน้าเว็บ (ไม่ใช่แค่บนวิดีโอตัวเล็กๆ)
+            # ใช้สำหรับปรับ slider ไหล่เอียง/ตัวเอน ให้เหมาะกับกล้องและระยะนั่งจริงของแต่ละคน
+            with metrics_placeholder.container():
+                mc1, mc2 = st.columns(2)
+                theta_val = state["theta"]
+                phi_val = state["phi"]
+                mc1.metric("มุมเอียงไหล่ที่วัดได้ (θ)",
+                           f"{theta_val:.1f}°" if theta_val is not None else "—")
+                mc2.metric("มุมเอนตัวที่วัดได้ (φ)",
+                           f"{phi_val:.1f}°" if phi_val is not None else "N/A (ไม่เห็นสะโพก)")
 
             if state["is_bad_posture"]:
                 if st.session_state.episode_start is None:
