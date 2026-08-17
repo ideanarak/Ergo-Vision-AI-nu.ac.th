@@ -6,10 +6,7 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 from ultralytics import YOLO
-import time
 import hashlib
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode, RTCConfiguration
-import av
 
 # ==========================================
 # ฟังก์ชันเข้ารหัสและตรวจสอบรหัสผ่าน
@@ -93,83 +90,10 @@ def save_to_db(conn, username, shoulder_tilt, torso_tilt, status):
     conn.commit()
 
 # ==========================================
-# คลาสประมวลผลวิดีโอสำหรับ Streamlit Cloud (WebRTC)
-# ==========================================
-class PostureProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.theta_threshold = 5
-        self.phi_threshold = 10
-        self.username = ""
-        self.bad_posture_start_time = None
-        self.save_counter = 0
-        self.conn = init_db()
-
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1) # กลับซ้ายขวาให้เป็นกระจก
-        
-        results = model(img, verbose=False)
-        annotated_frame = results[0].plot()
-
-        keypoints = results[0].keypoints
-        if keypoints is not None and len(keypoints.xy) > 0:
-            xy = keypoints.xy[0].cpu().numpy()
-            conf = keypoints.conf[0].cpu().numpy()
-
-            if len(xy) >= 13 and conf[5] > 0.3 and conf[6] > 0.3 and conf[11] > 0.3 and conf[12] > 0.3:
-                lx, ly = xy[5]
-                rx, ry = xy[6]
-                l_hip_x, l_hip_y = xy[11]
-                r_hip_x, r_hip_y = xy[12]
-
-                theta = get_shoulder_tilt_theta(lx, ly, rx, ry)
-                phi = get_torso_tilt_phi(lx, ly, rx, ry, l_hip_x, l_hip_y, r_hip_x, r_hip_y)
-
-                is_bad_posture = (theta > self.theta_threshold) or (phi > self.phi_threshold)
-
-                # พิมพ์มุมลงบนหน้าจอวิดีโอ
-                cv2.putText(annotated_frame, f"Shoulder Tilt: {theta:.1f} deg", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                cv2.putText(annotated_frame, f"Torso Tilt: {phi:.1f} deg", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
-                if is_bad_posture:
-                    if self.bad_posture_start_time is None:
-                        self.bad_posture_start_time = time.time()
-                    
-                    elapsed_time = time.time() - self.bad_posture_start_time
-                    
-                    if elapsed_time >= 10:
-                        cv2.putText(annotated_frame, "🚨 WARNING: BAD POSTURE > 10s!", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    else:
-                        cv2.putText(annotated_frame, f"⚠️ Bad Posture ({int(elapsed_time)}/10s)", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-                else:
-                    self.bad_posture_start_time = None
-                    cv2.putText(annotated_frame, "✅ Good Posture", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-                # บันทึกข้อมูลลงฐานข้อมูลทุกๆ ~30 เฟรม
-                self.save_counter += 1
-                if self.save_counter >= 30 and self.username != "":
-                    status_text = "ผิดปกติ" if is_bad_posture else "ปกติ"
-                    save_to_db(self.conn, self.username, theta, phi, status_text)
-                    self.save_counter = 0
-
-        return av.VideoFrame.from_ndarray(annotated_frame, format="bgr24")
-
-# ==========================================
 # 4. หน้าตาแอปพลิเคชัน (Streamlit UI)
 # ==========================================
 st.set_page_config(page_title="Ergo-Vision AI", layout="wide")
 conn = init_db()
-
-# ตั้งค่าเซิร์ฟเวอร์สำหรับ WebRTC (จำเป็นสำหรับ Cloud)
-RTC_CONFIGURATION = RTCConfiguration({
-    "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-        {"urls": ["stun:stun1.l.google.com:19302"]},
-        {"urls": ["stun:stun2.l.google.com:19302"]},
-        {"urls": ["stun:stun3.l.google.com:19302"]},
-        {"urls": ["stun:stun4.l.google.com:19302"]},
-    ]
-})
 
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
@@ -191,7 +115,6 @@ if not st.session_state.logged_in:
                 st.session_state.logged_in = True
                 st.session_state.username = username
                 st.success(f"ยินดีต้อนรับคุณ {username}")
-                time.sleep(1)
                 st.rerun() 
             else:
                 st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
@@ -220,32 +143,75 @@ else:
     
     st.sidebar.markdown("---")
     
-    tab1, tab2 = st.tabs(["📷 ตรวจจับแบบ Real-time", "📊 ฐานข้อมูล & ประวัติ"])
+    tab1, tab2 = st.tabs(["📷 ตรวจสอบท่านั่ง", "📊 ฐานข้อมูล & ประวัติ"])
 
     with tab1:
-        st.sidebar.header("⚙️ ตั้งค่าการตรวจจับ")
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("เกณฑ์การแจ้งเตือน (องศา)")
+        st.sidebar.header("⚙️ ตั้งค่าเกณฑ์ความผิดปกติ")
         theta_threshold = st.sidebar.slider('ไหล่เอียงสูงสุด (θ)', 1, 15, 5)
         phi_threshold = st.sidebar.slider('ตัวเอนสูงสุด (φ)', 1, 20, 10)
 
-        st.info("💡 หมายเหตุ: การตรวจจับบน Cloud จะแสดงสถานะและองศาซ้อนทับลงบนวิดีโอโดยตรง กรุณากดปุ่ม **START** ด้านล่างเพื่อเปิดกล้อง")
+        st.subheader("📸 ถ่ายภาพเพื่อประเมินท่านั่ง")
+        st.info("💡 ระบบจะทำการวิเคราะห์ท่านั่งของคุณจากภาพถ่าย และบันทึกข้อมูลลงในระบบ")
+        
+        # ใช้วิธีดึงกล้องแบบ Native ของ Streamlit
+        camera_image = st.camera_input("กดถ่ายภาพ")
 
-        # คอมโพเนนต์เปิดกล้องผ่านเบราว์เซอร์
-        webrtc_ctx = webrtc_streamer(
-            key="ergo-posture",
-            mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTC_CONFIGURATION,
-            video_processor_factory=PostureProcessor,
-            media_stream_constraints={"video": True, "audio": False},
-            async_processing=True,
-        )
+        if camera_image is not None:
+            # แปลงภาพจาก Streamlit เป็นรูปแบบที่ OpenCV / YOLO อ่านได้
+            bytes_data = camera_image.getvalue()
+            cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
+            
+            # ประมวลผลด้วย YOLO
+            results = model(cv2_img, verbose=False)
+            annotated_frame = results[0].plot()
+            image_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
 
-        # ส่งค่าจาก Slider เข้าไปในระบบประมวลผลวิดีโอ
-        if webrtc_ctx.video_processor:
-            webrtc_ctx.video_processor.theta_threshold = theta_threshold
-            webrtc_ctx.video_processor.phi_threshold = phi_threshold
-            webrtc_ctx.video_processor.username = st.session_state.username
+            keypoints = results[0].keypoints
+            
+            if keypoints is not None and len(keypoints.xy) > 0:
+                xy = keypoints.xy[0].cpu().numpy()
+                conf = keypoints.conf[0].cpu().numpy()
+
+                # ตรวจสอบว่าโมเดลจับจุดไหล่และสะโพกได้ครบถ้วนหรือไม่
+                if len(xy) >= 13 and conf[5] > 0.3 and conf[6] > 0.3 and conf[11] > 0.3 and conf[12] > 0.3:
+                    lx, ly = xy[5]
+                    rx, ry = xy[6]
+                    l_hip_x, l_hip_y = xy[11]
+                    r_hip_x, r_hip_y = xy[12]
+
+                    # คำนวณองศา
+                    theta = get_shoulder_tilt_theta(lx, ly, rx, ry)
+                    phi = get_torso_tilt_phi(lx, ly, rx, ry, l_hip_x, l_hip_y, r_hip_x, r_hip_y)
+
+                    is_bad_posture = (theta > theta_threshold) or (phi > phi_threshold)
+                    status_text = "ผิดปกติ" if is_bad_posture else "ปกติ"
+
+                    # แสดงผล
+                    col_img, col_res = st.columns([2, 1])
+                    
+                    with col_img:
+                        st.image(image_rgb, caption="ภาพที่วิเคราะห์แล้ว", use_container_width=True)
+                        
+                    with col_res:
+                        st.markdown("### ผลการประเมิน")
+                        if is_bad_posture:
+                            st.error(f"🚨 **{status_text}**")
+                            st.write("ตรวจพบความเอียงเกินเกณฑ์ที่กำหนด กรุณาปรับท่านั่งให้ตรงขึ้น")
+                        else:
+                            st.success(f"✅ **{status_text}**")
+                            st.write("ท่านั่งของคุณอยู่ในเกณฑ์ดีเยี่ยม!")
+                            
+                        st.metric("มุมไหล่เอียง (θ)", f"{theta:.1f}°", f"เกณฑ์: {theta_threshold}°", delta_color="off")
+                        st.metric("มุมตัวเอน (φ)", f"{phi:.1f}°", f"เกณฑ์: {phi_threshold}°", delta_color="off")
+
+                    # บันทึกข้อมูลลงฐานข้อมูล
+                    save_to_db(conn, st.session_state.username, theta, phi, status_text)
+                    st.toast('บันทึกข้อมูลลงฐานข้อมูลเรียบร้อยแล้ว!', icon='💾')
+                else:
+                    st.image(image_rgb, use_container_width=True)
+                    st.warning("⚠️ มองไม่เห็นจุดสำคัญในภาพ (ไหล่ หรือ สะโพก) กรุณาถ่ายใหม่ให้เห็นครึ่งตัวชัดเจน")
+            else:
+                st.warning("⚠️ ไม่พบคนในภาพ กรุณาถ่ายใหม่")
 
     with tab2:
         st.header(f"📂 ประวัติและแนวโน้มการนั่งของคุณ {st.session_state.username}")
