@@ -160,7 +160,9 @@ else:
     with tab1:
         st.sidebar.header("⚙️ ตั้งค่าการตรวจจับ")
         run = st.sidebar.checkbox('🟢 เปิดใช้งานระบบตรวจจับ', value=True)
-        camera_id = st.sidebar.selectbox('เลือกเบอร์กล้อง', [0, 1, 2])
+        
+        # กำหนดกล้องหลักเป็น 0 ทันที โดยไม่ต้องให้ผู้ใช้เลือก
+        camera_id = 0
         
         st.sidebar.markdown("---")
         st.sidebar.subheader("เกณฑ์การแจ้งเตือน (องศา)")
@@ -187,7 +189,7 @@ else:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
             if not cap.isOpened():
-                st.error("⚠️ ไม่สามารถเปิดกล้องได้ โปรดลองเปลี่ยนเบอร์กล้องที่เมนูด้านซ้าย")
+                st.error("⚠️ ไม่สามารถเปิดกล้องได้ โปรดตรวจสอบการเชื่อมต่อกล้อง")
             else:
                 save_counter = 0
                 while run:
@@ -247,13 +249,13 @@ else:
                                 st.session_state.bad_posture_start_time = None
                                 status_box.success("✅ ท่านั่งสมดุลดีเยี่ยม")
 
-                            metric_box1.metric("มุมไหล่เอียง (θ)", f"{theta:.1f}°")
-                            metric_box2.metric("มุมตัวเอน (φ)", f"{phi:.1f}°")
+                        metric_box1.metric("มุมไหล่เอียง (θ)", f"{theta:.1f}°")
+                        metric_box2.metric("มุมตัวเอน (φ)", f"{phi:.1f}°")
 
-                            save_counter += 1
-                            if save_counter >= 30:
-                                save_to_db(conn, st.session_state.username, theta, phi, "ผิดปกติ" if is_bad_posture else "ปกติ")
-                                save_counter = 0
+                        save_counter += 1
+                        if save_counter >= 30:
+                            save_to_db(conn, st.session_state.username, theta, phi, "ผิดปกติ" if is_bad_posture else "ปกติ")
+                            save_counter = 0
 
                     FRAME_WINDOW.image(image_rgb)
                     time.sleep(0.01) 
