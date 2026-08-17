@@ -31,19 +31,27 @@ model = load_yolo_model()
 # ถ้าไม่ตั้ง ttl แอปจะยังใช้ token เก่าที่หมดอายุไปเรื่อยๆ ทำให้ต่อกล้องไม่ติดแบบเงียบๆ
 @st.cache_data(ttl=3000)  # รีเฟรชทุก 50 นาที
 def get_ice_servers():
+    """คืนค่า (ice_servers, error_message)
+    error_message เป็น None ถ้าดึงจาก Twilio สำเร็จ, เป็น string ของ error จริงถ้าไม่สำเร็จ
+    (ไม่ใช้ st.warning() ในนี้ เพราะฟังก์ชันถูก cache — ข้อความจะไม่โชว์ซ้ำตอน cache hit)
+    """
+    if "TWILIO_ACCOUNT_SID" not in st.secrets or "TWILIO_AUTH_TOKEN" not in st.secrets:
+        return (
+            [{"urls": ["stun:stun.l.google.com:19302"]}],
+            "ไม่พบ TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN ใน st.secrets เลย "
+            "แปลว่ายังไม่ได้ตั้งค่าใน Streamlit Cloud > Settings > Secrets "
+            "หรือชื่อ key พิมพ์ผิด/ใส่ผิด section",
+        )
+
     try:
         account_sid = st.secrets["TWILIO_ACCOUNT_SID"]
         auth_token = st.secrets["TWILIO_AUTH_TOKEN"]
 
         client = Client(account_sid, auth_token)
         token = client.tokens.create()
-        return token.ice_servers
+        return token.ice_servers, None
     except Exception as e:
-        st.warning(
-            "ระบบยังไม่ได้ตั้งค่า Twilio หรือรหัสผิด จะใช้ STUN ของ Google แทน "
-            "ซึ่งอาจทำให้กล้องไม่ติดในบางเครือข่าย (โดยเฉพาะ WiFi องค์กร/มือถือที่มี NAT เข้ม)"
-        )
-        return [{"urls": ["stun:stun.l.google.com:19302"]}]
+        return [{"urls": ["stun:stun.l.google.com:19302"]}], f"{type(e).__name__}: {e}"
 
 # ==========================================
 # 3. ฟังก์ชันคำนวณคณิตศาสตร์
@@ -170,7 +178,7 @@ force_turn_relay = st.sidebar.checkbox(
 )
 
 # ตั้งค่าเซิร์ฟเวอร์ด้วย Twilio
-ice_servers = get_ice_servers()
+ice_servers, ice_error = get_ice_servers()
 
 rtc_config_dict = {"iceServers": ice_servers, "iceCandidatePoolSize": 10}
 if force_turn_relay:
@@ -178,7 +186,7 @@ if force_turn_relay:
 rtc_config = RTCConfiguration(rtc_config_dict)
 
 # --- Debug panel: เช็คว่ากำลังใช้ Twilio TURN จริง หรือ fallback เป็น Google STUN ---
-with st.sidebar.expander("🔍 ตรวจสอบสถานะ ICE Server"):
+with st.sidebar.expander("🔍 ตรวจสอบสถานะ ICE Server", expanded=(ice_error is not None)):
     urls_found = []
     for s in ice_servers:
         u = s.get("urls") if isinstance(s, dict) else getattr(s, "urls", None)
@@ -193,9 +201,12 @@ with st.sidebar.expander("🔍 ตรวจสอบสถานะ ICE Server")
     else:
         st.error(
             "❌ ไม่พบ Twilio TURN server — กำลังใช้ STUN ของ Google อย่างเดียว "
-            "(เน็ตที่บล็อก UDP/มีไฟร์วอลล์เข้มจะเชื่อมต่อไม่ได้แน่นอน) "
-            "ตรวจสอบ TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN ใน Secrets"
+            "(เน็ตที่บล็อก UDP/มีไฟร์วอลล์เข้มจะเชื่อมต่อไม่ได้แน่นอน)"
         )
+    if ice_error:
+        st.caption("รายละเอียด error จาก Twilio:")
+        st.code(ice_error, language="text")
+    st.caption("ICE server URLs ที่ใช้งานอยู่:")
     st.code("\n".join(urls_found) or "ไม่มีข้อมูล", language="text")
 
 # เปิดใช้งาน WebRTC — ขอความละเอียด/เฟรมเรตต่ำลงจากกล้องผู้ใช้ เพื่อลดภาระ encode/decode/inference
