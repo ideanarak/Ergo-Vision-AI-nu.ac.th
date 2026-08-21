@@ -703,7 +703,7 @@ with tab_camera:
                 mc1.metric("มุมเอียงไหล่ (θ)",
                            f"{theta_val:.1f}°" if theta_val is not None else "—")
                 mc2.metric("มุมเอนตัว (φ)",
-                           f"{phi_val:.1f}°" if phi_val is not None else "N/A (ไม่เห็นสะโพก)")
+                           f"{phi_val:.1f}°" if phi_val is not None else "   ")
                 if state["is_calibrated"]:
                     mc3.metric("ระดับก้ม (% ของท่าตรง)",
                                f"{neck_val:.0f}%" if neck_val is not None else "—")
