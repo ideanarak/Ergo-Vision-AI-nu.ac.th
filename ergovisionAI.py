@@ -404,7 +404,7 @@ class PostureTransformer(VideoTransformerBase):
                     cv2.putText(annotated_frame, f"Torso Tilt: {phi:.1f} deg", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
                 else:
-                    cv2.putText(annotated_frame, "Torso Tilt: ", (10, 60),
+                    cv2.putText(annotated_frame, "Torso Tilt: N/A (ไม่เห็นสะโพก)", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
                 if neck_ratio_pct is not None:
                     cv2.putText(annotated_frame, f"Neck Ratio: {neck_ratio_pct:.0f}% of upright", (10, 90),
@@ -597,11 +597,13 @@ alert_threshold_slider = st.sidebar.slider(
 
 st.sidebar.header("🌐 ตั้งค่าการเชื่อมต่อ (แก้ปัญหาเน็ตองค์กร/มหาวิทยาลัย)")
 force_turn_relay = st.sidebar.checkbox(
-    "บังคับใช้ TURN relay อย่างเดียว (แนะนำสำหรับเน็ตที่บล็อก UDP)",
-    value=True,
-    help="เน็ตมหาวิทยาลัย/องค์กรส่วนใหญ่บล็อก UDP ทิ้ง เหลือให้ผ่านได้แค่ TCP/443 "
-         "การบังคับใช้ TURN relay จะทำให้ทราฟฟิกวิ่งผ่าน TLS พอร์ต 443 เหมือน HTTPS ปกติ "
-         "ทำให้ไฟร์วอลล์ไม่บล็อก และยังเชื่อมต่อได้เร็วกว่าด้วย"
+    "บังคับใช้ TURN relay อย่างเดียว (เปิดเฉพาะตอนเน็ตบล็อก UDP เท่านั้น)",
+    value=False,
+    help="⚠️ ปกติไม่ต้องเปิด! ทิ้งไว้ปิด (ค่าเริ่มต้น) เบราว์เซอร์จะพยายามต่อตรงแบบ P2P ก่อนเสมอ "
+         "(ใช้ STUN เฉยๆ ไม่กิน TURN quota เลย) แล้วจะ fallback ไปใช้ TURN relay เองอัตโนมัติ "
+         "เฉพาะตอนต่อตรงไม่ได้จริงๆ เท่านั้น — วิธีนี้ประหยัด TURN bandwidth มากกว่ามาก "
+         "ให้เปิด checkbox นี้เฉพาะตอนทดสอบแล้วพบว่ากล้องไม่ติดจริงๆ บนเน็ตที่บล็อก UDP เข้ม "
+         "(เช่นเน็ตมหาวิทยาลัย) และอยากบังคับให้ข้ามการลอง P2P ไปเลยเพื่อความเร็วในการเชื่อมต่อ"
 )
 
 ice_servers, ice_error, ice_source = get_ice_servers()
@@ -639,17 +641,28 @@ tab_camera, tab_stats = st.tabs(["📹 เรียลไทม์", "📊 ส�
 # แท็บ: กล้อง real-time + แจ้งเตือน
 # ------------------------------------------
 with tab_camera:
+    # ตอนบังคับใช้ relay (จำเป็นเฉพาะเน็ตที่บล็อก UDP) ลดความละเอียด/เฟรมเรตลงอีก
+    # เพื่อประหยัด TURN bandwidth ต่อ session ให้มากที่สุด เพราะทราฟฟิกทั้งหมดต้องวิ่งผ่าน relay
+    if force_turn_relay:
+        video_constraints = {
+            "width": {"ideal": 480},
+            "height": {"ideal": 360},
+            "frameRate": {"ideal": 10, "max": 12},
+        }
+    else:
+        video_constraints = {
+            "width": {"ideal": 640},
+            "height": {"ideal": 480},
+            "frameRate": {"ideal": 15, "max": 15},
+        }
+
     webrtc_ctx = webrtc_streamer(
         key="ergo-posture-webrtc",
         mode=WebRtcMode.SENDRECV,
         rtc_configuration=rtc_config,
         video_processor_factory=PostureTransformer,
         media_stream_constraints={
-            "video": {
-                "width": {"ideal": 640},
-                "height": {"ideal": 480},
-                "frameRate": {"ideal": 15, "max": 15},
-            },
+            "video": video_constraints,
             "audio": False,
         },
         async_processing=True,
@@ -703,7 +716,7 @@ with tab_camera:
                 mc1.metric("มุมเอียงไหล่ (θ)",
                            f"{theta_val:.1f}°" if theta_val is not None else "—")
                 mc2.metric("มุมเอนตัว (φ)",
-                           f"{phi_val:.1f}°" if phi_val is not None else "   ")
+                           f"{phi_val:.1f}°" if phi_val is not None else "N/A (ไม่เห็นสะโพก)")
                 if state["is_calibrated"]:
                     mc3.metric("ระดับก้ม (% ของท่าตรง)",
                                f"{neck_val:.0f}%" if neck_val is not None else "—")
