@@ -404,7 +404,7 @@ class PostureTransformer(VideoTransformerBase):
                     cv2.putText(annotated_frame, f"Torso Tilt: {phi:.1f} deg", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
                 else:
-                    cv2.putText(annotated_frame, "Torso Tilt: N/A (ไม่เห็นสะโพก)", (10, 60),
+                    cv2.putText(annotated_frame, "Torso Tilt: ", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
                 if neck_ratio_pct is not None:
                     cv2.putText(annotated_frame, f"Neck Ratio: {neck_ratio_pct:.0f}% of upright", (10, 90),
