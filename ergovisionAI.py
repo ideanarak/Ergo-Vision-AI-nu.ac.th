@@ -40,7 +40,9 @@ OPEN_RELAY_ICE_SERVERS = [
 
 @st.cache_data(ttl=3000)  # รีเฟรชทุก 50 นาที
 def get_ice_servers():
-    """คืนค่า (ice_servers, error_message, source)"""
+    """คืนค่า (ice_servers, error_message, source)
+    ลำดับ: Twilio -> Xirsys -> Metered -> Open Relay ฟรี (สาธารณะ)
+    """
     errors = []
 
     if "TWILIO_ACCOUNT_SID" in st.secrets and "TWILIO_AUTH_TOKEN" in st.secrets:
@@ -52,6 +54,32 @@ def get_ice_servers():
             errors.append(f"Twilio: {type(e).__name__}: {e}")
     else:
         errors.append("Twilio: ไม่ได้ตั้งค่า secrets")
+
+    if "XIRSYS_IDENT" in st.secrets and "XIRSYS_SECRET" in st.secrets and "XIRSYS_CHANNEL" in st.secrets:
+        try:
+            import requests
+            ident = st.secrets["XIRSYS_IDENT"]
+            secret = st.secrets["XIRSYS_SECRET"]
+            channel = st.secrets["XIRSYS_CHANNEL"]
+            resp = requests.put(
+                f"https://global.xirsys.net/_turn/{channel}",
+                headers={"Content-Type": "application/json"},
+                auth=(ident, secret),
+                data="{}",
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("s") != "ok":
+                raise RuntimeError(f"Xirsys API ตอบกลับผิดปกติ: {data}")
+            # Xirsys คืนค่าเป็น object เดียว {urls: [...], username: ..., credential: ...}
+            # ต้องห่อเป็น list ให้ตรงรูปแบบที่ RTCConfiguration ต้องการ
+            ice_entry = data["v"]["iceServers"]
+            return [ice_entry], None, "xirsys"
+        except Exception as e:
+            errors.append(f"Xirsys: {type(e).__name__}: {e}")
+    else:
+        errors.append("Xirsys: ไม่ได้ตั้งค่า XIRSYS_IDENT / XIRSYS_SECRET / XIRSYS_CHANNEL")
 
     if "METERED_API_KEY" in st.secrets and "METERED_APP_NAME" in st.secrets:
         try:
@@ -553,6 +581,7 @@ rtc_config = RTCConfiguration(rtc_config_dict)
 
 SOURCE_LABEL = {
     "twilio": "✅ Twilio TURN (บัญชีตัวเอง)",
+    "xirsys": "✅ Xirsys TURN (บัญชีตัวเอง)",
     "metered": "✅ Metered TURN (บัญชีตัวเอง)",
     "openrelay": "🟡 Open Relay TURN สาธารณะ (ฟรี ใช้ได้ทันที แต่แชร์กับคนอื่น)",
 }
