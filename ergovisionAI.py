@@ -29,7 +29,7 @@ def load_yolo_model():
 model = load_yolo_model()
 
 # ==========================================
-# 2. ดึงค่า TURN Server (ลำดับ: Twilio -> Metered -> Open Relay ฟรี -> Google STUN)
+# 2. ดึงค่า TURN Server (ลำดับ: Twilio -> Xirsys -> Metered -> Open Relay ฟรี -> Google STUN)
 # ==========================================
 OPEN_RELAY_ICE_SERVERS = [
     {"urls": "stun:stun.relay.metered.ca:80"},
@@ -37,6 +37,35 @@ OPEN_RELAY_ICE_SERVERS = [
     {"urls": "turn:openrelay.metered.ca:443", "username": "openrelayproject", "credential": "openrelayproject"},
     {"urls": "turn:openrelay.metered.ca:443?transport=tcp", "username": "openrelayproject", "credential": "openrelayproject"},
 ]
+
+
+def normalize_ice_servers(raw):
+    """แปลง ice servers จากผู้ให้บริการต่างๆ ให้อยู่ในรูปแบบที่เบราว์เซอร์สมัยใหม่ยอมรับแน่นอน
+    - ต้องเป็น list ของ object เสมอ (ไม่ใช่ list ซ้อน list หรือ object เดี่ยว)
+    - แต่ละ object ต้องมี key 'urls' (พหูพจน์) เท่านั้น เบราว์เซอร์ปัจจุบันไม่รับ key 'url' (เอกพจน์) แบบเก่าแล้ว
+    ผิด format แม้แค่ entry เดียวจะทำให้ RTCPeerConnection พังทั้งก้อนด้วย error 'Malformed RTCIceServer'
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raw = [raw]
+
+    normalized = []
+    for entry in raw:
+        if isinstance(entry, list):
+            # เผื่อผู้ให้บริการบางเจ้าคืนค่าซ้อน list มาอีกชั้น
+            normalized.extend(normalize_ice_servers(entry))
+            continue
+        if not isinstance(entry, dict):
+            continue
+        entry = dict(entry)
+        if "urls" not in entry and "url" in entry:
+            entry["urls"] = entry.pop("url")
+        entry.pop("url", None)
+        if entry.get("urls"):
+            normalized.append(entry)
+    return normalized
+
 
 @st.cache_data(ttl=3000)  # รีเฟรชทุก 50 นาที
 def get_ice_servers():
@@ -49,7 +78,7 @@ def get_ice_servers():
         try:
             client = Client(st.secrets["TWILIO_ACCOUNT_SID"], st.secrets["TWILIO_AUTH_TOKEN"])
             token = client.tokens.create()
-            return token.ice_servers, None, "twilio"
+            return normalize_ice_servers(token.ice_servers), None, "twilio"
         except Exception as e:
             errors.append(f"Twilio: {type(e).__name__}: {e}")
     else:
@@ -72,10 +101,13 @@ def get_ice_servers():
             data = resp.json()
             if data.get("s") != "ok":
                 raise RuntimeError(f"Xirsys API ตอบกลับผิดปกติ: {data}")
-            # Xirsys คืนค่าเป็น object เดียว {urls: [...], username: ..., credential: ...}
-            # ต้องห่อเป็น list ให้ตรงรูปแบบที่ RTCConfiguration ต้องการ
-            ice_entry = data["v"]["iceServers"]
-            return [ice_entry], None, "xirsys"
+            # หมายเหตุ (แก้ bug): v.iceServers จาก Xirsys เป็น "array" ของเซิร์ฟเวอร์อยู่แล้ว
+            # (ตามเอกสารทางการ) ไม่ใช่ object เดี่ยว - ห้ามเอาไป wrap เป็น [ice_entry] ซ้ำ
+            # ไม่งั้นจะกลายเป็น list ซ้อน list ทำให้เบราว์เซอร์ error "Malformed RTCIceServer"
+            xirsys_servers = normalize_ice_servers(data["v"]["iceServers"])
+            if not xirsys_servers:
+                raise RuntimeError(f"Xirsys คืนค่า iceServers ว่างเปล่าหรือรูปแบบไม่ถูกต้อง: {data}")
+            return xirsys_servers, None, "xirsys"
         except Exception as e:
             errors.append(f"Xirsys: {type(e).__name__}: {e}")
     else:
@@ -92,14 +124,14 @@ def get_ice_servers():
                 timeout=10,
             )
             resp.raise_for_status()
-            return resp.json(), None, "metered"
+            return normalize_ice_servers(resp.json()), None, "metered"
         except Exception as e:
             errors.append(f"Metered: {type(e).__name__}: {e}")
     else:
         errors.append("Metered: ไม่ได้ตั้งค่า METERED_API_KEY / METERED_APP_NAME")
 
     errors.append("ใช้ Open Relay TURN สาธารณะแทน (ฟรี ไม่ต้องสมัคร แต่เป็นทรัพยากรที่แชร์กับคนอื่น)")
-    return OPEN_RELAY_ICE_SERVERS, " | ".join(errors), "openrelay"
+    return normalize_ice_servers(OPEN_RELAY_ICE_SERVERS), " | ".join(errors), "openrelay"
 
 # ==========================================
 # 3. ฐานข้อมูล (ผู้ใช้ + สถิติการนั่ง)
