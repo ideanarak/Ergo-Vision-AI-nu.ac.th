@@ -39,38 +39,39 @@ OPEN_RELAY_ICE_SERVERS = [
 ]
 
 @st.cache_data(ttl=3000)  # รีเฟรชทุก 50 นาที
-import requests
-from requests.auth import HTTPBasicAuth
-import streamlit as st
-
-@st.cache_data(ttl=3600)  # รีเฟรช Token ทุก 1 ชั่วโมง
 def get_ice_servers():
-    try:
-        ident = st.secrets["XIRSYS_IDENT"]
-        secret = st.secrets["XIRSYS_SECRET"]
-        channel = st.secrets["XIRSYS_CHANNEL"]
-        
-        # ยิง API ไปขอ TURN Server จาก Xirsys (ใช้ HTTP PUT)
-        url = f"https://global.xirsys.net/_turn/{channel}"
-        response = requests.put(
-            url, 
-            auth=HTTPBasicAuth(ident, secret),
-            json={"format": "urls"},
-            timeout=5
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("s") == "ok":
-                # ส่งคืนรายการ iceServers ให้ streamlit-webrtc
-                return data["v"]["iceServers"]
-        
-        st.warning(f"⚠️ Xirsys แจ้งเตือน: {response.text}")
-        return [{"urls": ["stun:stun.l.google.com:19302"]}]
-        
-    except Exception as e:
-        st.warning(f"⚠️ ไม่สามารถเชื่อมต่อ Xirsys ได้ สาเหตุ: {e}")
-        return [{"urls": ["stun:stun.l.google.com:19302"]}]
+    """คืนค่า (ice_servers, error_message, source)"""
+    errors = []
+
+    if "TWILIO_ACCOUNT_SID" in st.secrets and "TWILIO_AUTH_TOKEN" in st.secrets:
+        try:
+            client = Client(st.secrets["TWILIO_ACCOUNT_SID"], st.secrets["TWILIO_AUTH_TOKEN"])
+            token = client.tokens.create()
+            return token.ice_servers, None, "twilio"
+        except Exception as e:
+            errors.append(f"Twilio: {type(e).__name__}: {e}")
+    else:
+        errors.append("Twilio: ไม่ได้ตั้งค่า secrets")
+
+    if "METERED_API_KEY" in st.secrets and "METERED_APP_NAME" in st.secrets:
+        try:
+            import requests
+            app_name = st.secrets["METERED_APP_NAME"]
+            api_key = st.secrets["METERED_API_KEY"]
+            resp = requests.get(
+                f"https://{app_name}.metered.live/api/v1/turn/credentials",
+                params={"apiKey": api_key},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json(), None, "metered"
+        except Exception as e:
+            errors.append(f"Metered: {type(e).__name__}: {e}")
+    else:
+        errors.append("Metered: ไม่ได้ตั้งค่า METERED_API_KEY / METERED_APP_NAME")
+
+    errors.append("ใช้ Open Relay TURN สาธารณะแทน (ฟรี ไม่ต้องสมัคร แต่เป็นทรัพยากรที่แชร์กับคนอื่น)")
+    return OPEN_RELAY_ICE_SERVERS, " | ".join(errors), "openrelay"
 
 # ==========================================
 # 3. ฐานข้อมูล (ผู้ใช้ + สถิติการนั่ง)
